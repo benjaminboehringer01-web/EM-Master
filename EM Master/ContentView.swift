@@ -13,7 +13,7 @@ struct CalloutItem: Identifiable, Equatable {
     var targetNorm: CGPoint       // 0.0 ... 1.0
     var boxOffset: CGSize = CGSize(width: -30, height: -30)
     var text: String = ""
-    var hasLeaderLine: Bool = true // true = mit Linie, false = reiner Kasten ohne Linie (⌘+Klick)
+    var hasLeaderLine: Bool = true // true = mit Linie, false = reiner Kasten (⌘+Klick)
     
     /// Berechnet den Mittelpunkt des Badges mit automatischem Abknicken am Rand
     func badgeCenter(in size: CGSize, badgeRadius: CGFloat = 13) -> CGPoint {
@@ -23,7 +23,7 @@ struct CalloutItem: Identifiable, Equatable {
             y: targetNorm.y * size.height
         )
         
-        // Direkter Kasten ohne Linie (zentriert auf Klickpunkt + evtl. Verschiebung)
+        // Direkter Kasten ohne Linie
         if !hasLeaderLine {
             let finalX = min(max(badgeRadius, target.x + boxOffset.width), size.width - badgeRadius)
             let finalY = min(max(badgeRadius, target.y + boxOffset.height), size.height - badgeRadius)
@@ -33,7 +33,7 @@ struct CalloutItem: Identifiable, Equatable {
         var ox = boxOffset.width
         var oy = boxOffset.height
         
-        // Auto-Flip (Abknicken) für Marker mit Linie
+        // Auto-Flip am Rand
         if target.x + ox < badgeRadius {
             ox = abs(ox)
         } else if target.x + ox > size.width - badgeRadius {
@@ -70,6 +70,9 @@ struct ContentView: View {
     // Crop State
     @State private var mode: AppMode = .annotate
     @State private var cropRectNorm: CGRect = CGRect(x: 0.1, y: 0.1, width: 0.8, height: 0.8)
+    
+    // Feedback nach dem Kopieren
+    @State private var isCopiedFeedback: Bool = false
     
     var body: some View {
         HSplitView {
@@ -109,7 +112,7 @@ struct ContentView: View {
             }
             .frame(minWidth: 520, minHeight: 480)
             
-            // RECHTER BEREICH: Notizen & Export
+            // RECHTER BEREICH: Notizen & Kombinierter Export
             sidePanelView
         }
         .onPasteCommand(of: [.png, .tiff]) { providers in
@@ -129,7 +132,7 @@ struct ContentView: View {
                 .resizable()
                 .frame(width: size.width, height: size.height)
             
-            // 2. Verbindungslinien (nur für Marker mit hasLeaderLine == true)
+            // 2. Verbindungslinien
             if mode == .annotate {
                 Canvas { context, _ in
                     let baseWidth = max(1.5, size.width * 0.0015)
@@ -286,7 +289,7 @@ struct ContentView: View {
         self.magnification = 1.0
     }
     
-    // MARK: - Marker Management (Normaler Klick vs ⌘+Klick)
+    // MARK: - Marker Management
     private func addCallout(at normPoint: CGPoint, withLeaderLine: Bool) {
         guard let img = image else { return }
         let nextIndex = callouts.count
@@ -297,7 +300,7 @@ struct ContentView: View {
             let initialOffsetY: CGFloat = (normPoint.y < 0.08) ? 35 : -35
             initialOffset = CGSize(width: initialOffsetX, height: initialOffsetY)
         } else {
-            initialOffset = .zero // Direkt zentriert am Klickpunkt
+            initialOffset = .zero
         }
         
         let newItem = CalloutItem(
@@ -307,9 +310,6 @@ struct ContentView: View {
             hasLeaderLine: withLeaderLine
         )
         callouts.append(newItem)
-        
-        let typ = withLeaderLine ? "mit Zeigerlinie" : "direkter Kasten (⌘+Klick)"
-        print("🎯 [Marker platziert (\(typ))] Label: \(newItem.label) bei norm (\(String(format: "%.3f", normPoint.x)), \(String(format: "%.3f", normPoint.y)))")
         
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             self.focusedId = newItem.id
@@ -325,7 +325,7 @@ struct ContentView: View {
         }
     }
     
-    // MARK: - Pasteboard & Export
+    // MARK: - Pasteboard & Kombinierter RemNote Export
     private func pasteFromClipboard() {
         let pb = NSPasteboard.general
         if let data = pb.data(forType: .png) ?? pb.data(forType: .tiff),
@@ -356,17 +356,10 @@ struct ContentView: View {
         self.mode = .annotate
     }
     
-    private func copyTextToClipboard() {
-        let lines = callouts.map { "• \($0.label) -> \($0.text)" }
-        let text = lines.joined(separator: "\n")
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(text, forType: .string)
-    }
-    
+    /// Rendert das annotierte Bild intern als NSImage
     @MainActor
-    private func copyAnnotatedImageToClipboard() {
-        guard let image = image else { return }
+    private func renderAnnotatedImage() -> NSImage? {
+        guard let image = image else { return nil }
         
         let renderView = ZStack {
             Image(nsImage: image)
@@ -408,10 +401,82 @@ struct ContentView: View {
         
         let renderer = ImageRenderer(content: renderView)
         renderer.scale = 2.0
-        if let nsImage = renderer.nsImage {
-            let pb = NSPasteboard.general
-            pb.clearContents()
-            pb.writeObjects([nsImage])
+        return renderer.nsImage
+    }
+    
+    /// Kopiert Bild + Anki/RemNote-Liste in einem einzigen Schritt in die Zwischenablage
+    @MainActor
+    private func copyCombinedToClipboard() {
+        guard let nsImage = renderAnnotatedImage(),
+              let tiffData = nsImage.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiffData),
+              let pngData = bitmap.representation(using: .png, properties: [:]) else { return }
+        
+        let base64Image = pngData.base64EncodedString()
+        
+        // 1. HTML für RemNote, Notion & Web-Editoren
+        let listItemsHtml = callouts.map { item in
+            let text = item.text.trimmingCharacters(in: .whitespaces)
+            return "<li><strong>\(item.label)</strong> &rarr; \(text)</li>"
+        }.joined(separator: "")
+        
+        let htmlString = """
+        <p><img src="data:image/png;base64,\(base64Image)" alt="REM Image" style="max-width:100%; height:auto;" /></p>
+        <ul style="list-style-type: disc; margin-top: 10px;">
+        \(listItemsHtml)
+        </ul>
+        """
+        
+        // 2. Plain-Text Fallback
+        let plainText = callouts.map { item in
+            let text = item.text.trimmingCharacters(in: .whitespaces)
+            return text.isEmpty ? "• \(item.label) →" : "• \(item.label) → \(text)"
+        }.joined(separator: "\n")
+        
+        // 3. RTFD für native macOS-Apps (Apple Notes, Pages etc.)
+        let attrString = NSMutableAttributedString()
+        let attachment = NSTextAttachment()
+        attachment.image = nsImage
+        attrString.append(NSAttributedString(attachment: attachment))
+        attrString.append(NSAttributedString(string: "\n\n"))
+        
+        let font = NSFont.systemFont(ofSize: 14)
+        for item in callouts {
+            let text = item.text.trimmingCharacters(in: .whitespaces)
+            let line = text.isEmpty ? "• \(item.label) →\n" : "• \(item.label) → \(text)\n"
+            attrString.append(NSAttributedString(string: line, attributes: [.font: font]))
+        }
+        
+        let rtfdData = try? attrString.data(
+            from: NSRange(location: 0, length: attrString.length),
+            documentAttributes: [.documentType: NSAttributedString.DocumentType.rtfd]
+        )
+        
+        // Alles in das Pasteboard schreiben
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        
+        let pbItem = NSPasteboardItem()
+        pbItem.setData(pngData, forType: .png)
+        pbItem.setData(tiffData, forType: .tiff)
+        if let htmlData = htmlString.data(using: .utf8) {
+            pbItem.setData(htmlData, forType: .html)
+        }
+        if let rtfdData = rtfdData {
+            pbItem.setData(rtfdData, forType: .rtfd)
+        }
+        pbItem.setString(plainText, forType: .string)
+        
+        pb.writeObjects([pbItem])
+        
+        // Feedback-Animation
+        withAnimation(.easeInOut(duration: 0.2)) {
+            isCopiedFeedback = true
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                isCopiedFeedback = false
+            }
         }
     }
     
@@ -449,7 +514,6 @@ struct ContentView: View {
                             HStack(spacing: 8) {
                                 CalloutBadgeView(label: item.label)
                                 
-                                // Einheitlicher Pfeil für alle Marker-Arten
                                 Image(systemName: "arrow.right")
                                     .foregroundColor(.secondary)
                                     .font(.caption)
@@ -472,20 +536,19 @@ struct ContentView: View {
             
             Spacer()
             
-            VStack(spacing: 8) {
-                Button(action: copyAnnotatedImageToClipboard) {
-                    Label("Bild kopieren (mit Markern)", systemImage: "photo.badge.arrow.down")
-                        .frame(maxWidth: .infinity)
+            // EINZIGER EXPORT-BUTTON
+            Button(action: copyCombinedToClipboard) {
+                HStack(spacing: 8) {
+                    Image(systemName: isCopiedFeedback ? "checkmark.circle.fill" : "doc.on.clipboard.fill")
+                    Text(isCopiedFeedback ? "In RemNote einfügebereit! ✓" : "Bild + Liste für RemNote kopieren")
+                        .bold()
                 }
-                .controlSize(.regular)
-                
-                Button(action: copyTextToClipboard) {
-                    Label("Text / Anki-Liste kopieren", systemImage: "doc.on.clipboard")
-                        .frame(maxWidth: .infinity)
-                }
-                .controlSize(.regular)
-                .buttonStyle(.borderedProminent)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 4)
             }
+            .controlSize(.large)
+            .buttonStyle(.borderedProminent)
+            .tint(isCopiedFeedback ? .green : .accentColor)
             .disabled(image == nil || callouts.isEmpty)
         }
         .padding(14)
