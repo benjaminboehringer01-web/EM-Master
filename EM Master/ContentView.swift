@@ -47,7 +47,20 @@ struct ContentView: View {
                     if let image = image {
                         NativeZoomableScrollView(
                             magnification: $magnification,
-                            contentSize: image.size
+                            contentSize: image.size,
+                            mode: mode,
+                            callouts: callouts,
+                            onAddCallout: { normPoint in
+                                addCallout(at: normPoint)
+                            },
+                            onUpdateCalloutOffset: { index, newOffset in
+                                if index < callouts.count {
+                                    callouts[index].boxOffset = newOffset
+                                }
+                            },
+                            onCropDrag: { normRect in
+                                self.cropRectNorm = normRect
+                            }
                         ) {
                             canvasContent(image: image, size: image.size)
                         }
@@ -69,7 +82,7 @@ struct ContentView: View {
         }
     }
     
-    // MARK: - Bildinhalt (Vollflächig klickbar über gesamte Bilddimension)
+    // MARK: - Bildinhalt (Reine Darstellung)
     @ViewBuilder
     private func canvasContent(image: NSImage, size: CGSize) -> some View {
         ZStack(alignment: .topLeading) {
@@ -98,54 +111,26 @@ struct ContentView: View {
                     }
                 }
                 .frame(width: size.width, height: size.height)
-                .allowsHitTesting(false)
             }
             
-            // 3. Native Klick- & Drag-Ebene in SwiftUI (Deckungsgleich bis zur untersten Kante)
-            Color.clear
-                .contentShape(Rectangle())
-                .frame(width: size.width, height: size.height)
-                .gesture(
-                    DragGesture(minimumDistance: 0, coordinateSpace: .local)
-                        .onChanged { value in
-                            if mode == .crop {
-                                let start = value.startLocation
-                                let current = value.location
-                                
-                                let minX = max(0, min(size.width, min(start.x, current.x)))
-                                let minY = max(0, min(size.height, min(start.y, current.y)))
-                                let maxX = max(0, min(size.width, max(start.x, current.x)))
-                                let maxY = max(0, min(size.height, max(start.y, current.y)))
-                                
-                                let normRect = CGRect(
-                                    x: minX / size.width,
-                                    y: minY / size.height,
-                                    width: max(0.02, (maxX - minX) / size.width),
-                                    height: max(0.02, (maxY - minY) / size.height)
-                                )
-                                self.cropRectNorm = normRect
-                            }
-                        }
-                        .onEnded { value in
-                            if mode == .annotate {
-                                let dist = hypot(value.translation.width, value.translation.height)
-                                if dist < 6 { // Klick registriert
-                                    let normX = max(0, min(1, value.location.x / size.width))
-                                    let normY = max(0, min(1, value.location.y / size.height))
-                                    addCallout(at: CGPoint(x: normX, y: normY))
-                                }
-                            }
-                        }
-                )
-            
-            // 4. Buchstaben-Boxen
+            // 3. Buchstaben-Boxen
             if mode == .annotate {
-                ForEach($callouts) { $item in
-                    DraggableCalloutBadge(item: $item, containerSize: size)
+                ForEach(callouts) { item in
+                    let target = CGPoint(
+                        x: item.targetNorm.x * size.width,
+                        y: item.targetNorm.y * size.height
+                    )
+                    let currentBoxPos = CGPoint(
+                        x: target.x + item.boxOffset.width,
+                        y: target.y + item.boxOffset.height
+                    )
+                    
+                    CalloutBadgeView(label: item.label)
+                        .position(currentBoxPos)
                 }
             }
             
-            // 5. Crop-Overlay
+            // 4. Crop-Overlay
             if mode == .crop {
                 CropOverlayView(
                     cropRect: cropRectNorm,
@@ -267,6 +252,7 @@ struct ContentView: View {
     
     // MARK: - Marker Management
     private func addCallout(at normPoint: CGPoint) {
+        guard let img = image else { return }
         let nextIndex = callouts.count
         let newItem = CalloutItem(
             index: nextIndex,
@@ -274,6 +260,11 @@ struct ContentView: View {
             boxOffset: CGSize(width: -30, height: -30)
         )
         callouts.append(newItem)
+        
+        let pixelX = normPoint.x * img.size.width
+        let pixelY = normPoint.y * img.size.height
+        print("🎯 [Marker platziert] Label: \(newItem.label) bei Pixel (\(String(format: "%.1f", pixelX)), \(String(format: "%.1f", pixelY))) von Bild \(img.size)")
+        
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             self.focusedId = newItem.id
         }
@@ -476,53 +467,34 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Einzelner ziehbarer Badge (Präzise Hitbox)
-struct DraggableCalloutBadge: View {
-    @Binding var item: CalloutItem
-    let containerSize: CGSize
-    @State private var dragBaseOffset: CGSize? = nil
-    
-    var body: some View {
-        let target = CGPoint(
-            x: item.targetNorm.x * containerSize.width,
-            y: item.targetNorm.y * containerSize.height
-        )
-        let currentBoxPos = CGPoint(
-            x: target.x + item.boxOffset.width,
-            y: target.y + item.boxOffset.height
-        )
-        
-        CalloutBadgeView(label: item.label)
-            .gesture(
-                DragGesture()
-                    .onChanged { value in
-                        if dragBaseOffset == nil {
-                            dragBaseOffset = item.boxOffset
-                        }
-                        if let base = dragBaseOffset {
-                            item.boxOffset = CGSize(
-                                width: base.width + value.translation.width,
-                                height: base.height + value.translation.height
-                            )
-                        }
-                    }
-                    .onEnded { _ in
-                        dragBaseOffset = nil
-                    }
-            )
-            .position(currentBoxPos)
-    }
-}
-
-// MARK: - Native AppKit ScrollView
+// MARK: - Native AppKit ScrollView mit Overlay-Interaktion
 struct NativeZoomableScrollView<Content: View>: NSViewRepresentable {
     @Binding var magnification: CGFloat
     let contentSize: CGSize
+    let mode: AppMode
+    let callouts: [CalloutItem]
+    var onAddCallout: (CGPoint) -> Void
+    var onUpdateCalloutOffset: (Int, CGSize) -> Void
+    var onCropDrag: (CGRect) -> Void
     let content: Content
 
-    init(magnification: Binding<CGFloat>, contentSize: CGSize, @ViewBuilder content: () -> Content) {
+    init(
+        magnification: Binding<CGFloat>,
+        contentSize: CGSize,
+        mode: AppMode,
+        callouts: [CalloutItem],
+        onAddCallout: @escaping (CGPoint) -> Void,
+        onUpdateCalloutOffset: @escaping (Int, CGSize) -> Void,
+        onCropDrag: @escaping (CGRect) -> Void,
+        @ViewBuilder content: () -> Content
+    ) {
         self._magnification = magnification
         self.contentSize = contentSize
+        self.mode = mode
+        self.callouts = callouts
+        self.onAddCallout = onAddCallout
+        self.onUpdateCalloutOffset = onUpdateCalloutOffset
+        self.onCropDrag = onCropDrag
         self.content = content()
     }
 
@@ -537,13 +509,33 @@ struct NativeZoomableScrollView<Content: View>: NSViewRepresentable {
         scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
 
-        let hostingView = HostingDocumentView(rootView: content)
-        hostingView.targetSize = contentSize
+        let documentContainer = FlippedDocumentContainerView()
+        documentContainer.targetSize = contentSize
+        documentContainer.frame = NSRect(origin: .zero, size: contentSize)
+
+        // 1. SwiftUI Host View (Zeichnet das Bild und die Marker)
+        let hostingView = NSHostingView(rootView: content)
         hostingView.frame = NSRect(origin: .zero, size: contentSize)
-        hostingView.autoresizingMask = []
-        scrollView.documentView = hostingView
+        hostingView.autoresizingMask = [.width, .height]
+        documentContainer.addSubview(hostingView)
+
+        // 2. Native AppKit Interaktions-Ebene (Empfängt Klicks & Drag ohne Zoom-Verzerrung)
+        let interactionOverlay = CanvasInteractionOverlayView()
+        interactionOverlay.frame = NSRect(origin: .zero, size: contentSize)
+        interactionOverlay.autoresizingMask = [.width, .height]
+        interactionOverlay.contentSize = contentSize
+        interactionOverlay.mode = mode
+        interactionOverlay.callouts = callouts
+        interactionOverlay.onAddCallout = onAddCallout
+        interactionOverlay.onUpdateCalloutOffset = onUpdateCalloutOffset
+        interactionOverlay.onCropDrag = onCropDrag
+        documentContainer.addSubview(interactionOverlay)
+
+        scrollView.documentView = documentContainer
         
+        context.coordinator.documentContainer = documentContainer
         context.coordinator.hostingView = hostingView
+        context.coordinator.interactionOverlay = interactionOverlay
         context.coordinator.scrollView = scrollView
 
         NotificationCenter.default.addObserver(
@@ -557,10 +549,26 @@ struct NativeZoomableScrollView<Content: View>: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSScrollView, context: Context) {
-        if let doc = nsView.documentView as? HostingDocumentView<Content> {
-            doc.rootView = content
+        if let doc = context.coordinator.documentContainer {
             if doc.targetSize != contentSize {
                 doc.targetSize = contentSize
+            }
+        }
+        if let hosting = context.coordinator.hostingView {
+            hosting.rootView = content
+            if hosting.frame.size != contentSize {
+                hosting.frame = NSRect(origin: .zero, size: contentSize)
+            }
+        }
+        if let overlay = context.coordinator.interactionOverlay {
+            overlay.contentSize = contentSize
+            overlay.mode = mode
+            overlay.callouts = callouts
+            overlay.onAddCallout = onAddCallout
+            overlay.onUpdateCalloutOffset = onUpdateCalloutOffset
+            overlay.onCropDrag = onCropDrag
+            if overlay.frame.size != contentSize {
+                overlay.frame = NSRect(origin: .zero, size: contentSize)
             }
         }
         
@@ -575,7 +583,9 @@ struct NativeZoomableScrollView<Content: View>: NSViewRepresentable {
 
     class Coordinator: NSObject {
         var parent: NativeZoomableScrollView
-        var hostingView: HostingDocumentView<Content>?
+        var documentContainer: FlippedDocumentContainerView?
+        var hostingView: NSHostingView<Content>?
+        var interactionOverlay: CanvasInteractionOverlayView?
         weak var scrollView: NSScrollView?
 
         init(_ parent: NativeZoomableScrollView) {
@@ -591,8 +601,108 @@ struct NativeZoomableScrollView<Content: View>: NSViewRepresentable {
     }
 }
 
-// MARK: - Hosting Document View
-class HostingDocumentView<Content: View>: NSHostingView<Content> {
+// MARK: - Native AppKit Interaktions-Overlay (Pixelgenau bei jedem Zoomlevel)
+class CanvasInteractionOverlayView: NSView {
+    override var isFlipped: Bool { true }
+
+    var contentSize: CGSize = .zero
+    var mode: AppMode = .annotate
+    var callouts: [CalloutItem] = []
+    var onAddCallout: ((CGPoint) -> Void)?
+    var onUpdateCalloutOffset: ((Int, CGSize) -> Void)?
+    var onCropDrag: ((CGRect) -> Void)?
+
+    private var activeDraggedCalloutIndex: Int?
+    private var dragStartLoc: CGPoint?
+    private var dragStartBoxOffset: CGSize = .zero
+    private var isDragging: Bool = false
+
+    override func mouseDown(with event: NSEvent) {
+        let loc = convert(event.locationInWindow, from: nil)
+        dragStartLoc = loc
+        isDragging = false
+        activeDraggedCalloutIndex = nil
+
+        guard contentSize.width > 0, contentSize.height > 0 else { return }
+
+        if mode == .annotate {
+            // Prüfen, ob ein Marker-Badge angeklickt wurde (30x30 Klick-Bereich)
+            for (idx, item) in callouts.enumerated().reversed() {
+                let badgeCenter = CGPoint(
+                    x: item.targetNorm.x * contentSize.width + item.boxOffset.width,
+                    y: item.targetNorm.y * contentSize.height + item.boxOffset.height
+                )
+                let badgeRect = CGRect(
+                    x: badgeCenter.x - 15,
+                    y: badgeCenter.y - 15,
+                    width: 30,
+                    height: 30
+                )
+                if badgeRect.contains(loc) {
+                    activeDraggedCalloutIndex = idx
+                    dragStartBoxOffset = item.boxOffset
+                    break
+                }
+            }
+        }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let start = dragStartLoc, contentSize.width > 0, contentSize.height > 0 else { return }
+        let current = convert(event.locationInWindow, from: nil)
+        let dist = hypot(current.x - start.x, current.y - start.y)
+        if dist > 3 {
+            isDragging = true
+        }
+
+        if let draggedIdx = activeDraggedCalloutIndex, mode == .annotate {
+            // Marker verschieben (1:1 am Mauszeiger bei jedem Zoomfaktor)
+            let dx = current.x - start.x
+            let dy = current.y - start.y
+            let newOffset = CGSize(
+                width: dragStartBoxOffset.width + dx,
+                height: dragStartBoxOffset.height + dy
+            )
+            onUpdateCalloutOffset?(draggedIdx, newOffset)
+        } else if mode == .crop {
+            // Zuschneide-Rechteck ziehen
+            let minX = max(0, min(contentSize.width, min(start.x, current.x)))
+            let minY = max(0, min(contentSize.height, min(start.y, current.y)))
+            let maxX = max(0, min(contentSize.width, max(start.x, current.x)))
+            let maxY = max(0, min(contentSize.height, max(start.y, current.y)))
+
+            let normRect = CGRect(
+                x: minX / contentSize.width,
+                y: minY / contentSize.height,
+                width: max(0.02, (maxX - minX) / contentSize.width),
+                height: max(0.02, (maxY - minY) / contentSize.height)
+            )
+            onCropDrag?(normRect)
+        }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let loc = convert(event.locationInWindow, from: nil)
+
+        if mode == .annotate && activeDraggedCalloutIndex == nil && !isDragging {
+            // Neuer Marker durch einfachen Klick
+            if contentSize.width > 0, contentSize.height > 0 {
+                let normX = max(0, min(1, loc.x / contentSize.width))
+                let normY = max(0, min(1, loc.y / contentSize.height))
+                onAddCallout?(CGPoint(x: normX, y: normY))
+            }
+        }
+
+        dragStartLoc = nil
+        activeDraggedCalloutIndex = nil
+        isDragging = false
+    }
+}
+
+// MARK: - Flipped Document Container
+class FlippedDocumentContainerView: NSView {
+    override var isFlipped: Bool { true }
+
     var targetSize: NSSize = .zero {
         didSet {
             frame = NSRect(origin: .zero, size: targetSize)
