@@ -11,8 +11,46 @@ struct CalloutItem: Identifiable, Equatable {
         return String(UnicodeScalar(65 + index)!)
     }
     var targetNorm: CGPoint       // 0.0 ... 1.0
-    var boxOffset: CGSize = CGSize(width: -25, height: -25)
+    var boxOffset: CGSize = CGSize(width: -30, height: -30)
     var text: String = ""
+    var hasLeaderLine: Bool = true // true = mit Linie, false = reiner Kasten ohne Linie (⌘+Klick)
+    
+    /// Berechnet den Mittelpunkt des Badges mit automatischem Abknicken am Rand
+    func badgeCenter(in size: CGSize, badgeRadius: CGFloat = 13) -> CGPoint {
+        guard size.width > 0, size.height > 0 else { return .zero }
+        let target = CGPoint(
+            x: targetNorm.x * size.width,
+            y: targetNorm.y * size.height
+        )
+        
+        // Direkter Kasten ohne Linie (zentriert auf Klickpunkt + evtl. Verschiebung)
+        if !hasLeaderLine {
+            let finalX = min(max(badgeRadius, target.x + boxOffset.width), size.width - badgeRadius)
+            let finalY = min(max(badgeRadius, target.y + boxOffset.height), size.height - badgeRadius)
+            return CGPoint(x: finalX, y: finalY)
+        }
+        
+        var ox = boxOffset.width
+        var oy = boxOffset.height
+        
+        // Auto-Flip (Abknicken) für Marker mit Linie
+        if target.x + ox < badgeRadius {
+            ox = abs(ox)
+        } else if target.x + ox > size.width - badgeRadius {
+            ox = -abs(ox)
+        }
+        
+        if target.y + oy < badgeRadius {
+            oy = abs(oy)
+        } else if target.y + oy > size.height - badgeRadius {
+            oy = -abs(oy)
+        }
+        
+        let finalX = min(max(badgeRadius, target.x + ox), size.width - badgeRadius)
+        let finalY = min(max(badgeRadius, target.y + oy), size.height - badgeRadius)
+        
+        return CGPoint(x: finalX, y: finalY)
+    }
 }
 
 enum AppMode {
@@ -50,8 +88,8 @@ struct ContentView: View {
                             contentSize: image.size,
                             mode: mode,
                             callouts: callouts,
-                            onAddCallout: { normPoint in
-                                addCallout(at: normPoint)
+                            onAddCallout: { normPoint, withLeaderLine in
+                                addCallout(at: normPoint, withLeaderLine: withLeaderLine)
                             },
                             onUpdateCalloutOffset: { index, newOffset in
                                 if index < callouts.count {
@@ -82,7 +120,7 @@ struct ContentView: View {
         }
     }
     
-    // MARK: - Bildinhalt (Reine Darstellung)
+    // MARK: - Bildinhalt
     @ViewBuilder
     private func canvasContent(image: NSImage, size: CGSize) -> some View {
         ZStack(alignment: .topLeading) {
@@ -91,23 +129,28 @@ struct ContentView: View {
                 .resizable()
                 .frame(width: size.width, height: size.height)
             
-            // 2. Verbindungslinien
+            // 2. Verbindungslinien (nur für Marker mit hasLeaderLine == true)
             if mode == .annotate {
                 Canvas { context, _ in
-                    for item in callouts {
+                    let baseWidth = max(1.5, size.width * 0.0015)
+                    let outlineWidth = baseWidth + 2.5
+                    
+                    let whiteStyle = StrokeStyle(lineWidth: outlineWidth, lineCap: .round, lineJoin: .round)
+                    let blackStyle = StrokeStyle(lineWidth: baseWidth, lineCap: .round, lineJoin: .round)
+                    
+                    for item in callouts where item.hasLeaderLine {
                         let target = CGPoint(
                             x: item.targetNorm.x * size.width,
                             y: item.targetNorm.y * size.height
                         )
-                        let boxCenter = CGPoint(
-                            x: target.x + item.boxOffset.width,
-                            y: target.y + item.boxOffset.height
-                        )
+                        let boxCenter = item.badgeCenter(in: size)
                         
                         var path = Path()
                         path.move(to: target)
                         path.addLine(to: boxCenter)
-                        context.stroke(path, with: .color(.black), lineWidth: max(1.5, size.width * 0.0015))
+                        
+                        context.stroke(path, with: .color(.white), style: whiteStyle)
+                        context.stroke(path, with: .color(.black), style: blackStyle)
                     }
                 }
                 .frame(width: size.width, height: size.height)
@@ -116,14 +159,7 @@ struct ContentView: View {
             // 3. Buchstaben-Boxen
             if mode == .annotate {
                 ForEach(callouts) { item in
-                    let target = CGPoint(
-                        x: item.targetNorm.x * size.width,
-                        y: item.targetNorm.y * size.height
-                    )
-                    let currentBoxPos = CGPoint(
-                        x: target.x + item.boxOffset.width,
-                        y: target.y + item.boxOffset.height
-                    )
+                    let currentBoxPos = item.badgeCenter(in: size)
                     
                     CalloutBadgeView(label: item.label)
                         .position(currentBoxPos)
@@ -250,20 +286,30 @@ struct ContentView: View {
         self.magnification = 1.0
     }
     
-    // MARK: - Marker Management
-    private func addCallout(at normPoint: CGPoint) {
+    // MARK: - Marker Management (Normaler Klick vs ⌘+Klick)
+    private func addCallout(at normPoint: CGPoint, withLeaderLine: Bool) {
         guard let img = image else { return }
         let nextIndex = callouts.count
+        
+        let initialOffset: CGSize
+        if withLeaderLine {
+            let initialOffsetX: CGFloat = (normPoint.x < 0.08) ? 35 : -35
+            let initialOffsetY: CGFloat = (normPoint.y < 0.08) ? 35 : -35
+            initialOffset = CGSize(width: initialOffsetX, height: initialOffsetY)
+        } else {
+            initialOffset = .zero // Direkt zentriert am Klickpunkt
+        }
+        
         let newItem = CalloutItem(
             index: nextIndex,
             targetNorm: normPoint,
-            boxOffset: CGSize(width: -30, height: -30)
+            boxOffset: initialOffset,
+            hasLeaderLine: withLeaderLine
         )
         callouts.append(newItem)
         
-        let pixelX = normPoint.x * img.size.width
-        let pixelY = normPoint.y * img.size.height
-        print("🎯 [Marker platziert] Label: \(newItem.label) bei Pixel (\(String(format: "%.1f", pixelX)), \(String(format: "%.1f", pixelY))) von Bild \(img.size)")
+        let typ = withLeaderLine ? "mit Zeigerlinie" : "direkter Kasten (⌘+Klick)"
+        print("🎯 [Marker platziert (\(typ))] Label: \(newItem.label) bei norm (\(String(format: "%.3f", normPoint.x)), \(String(format: "%.3f", normPoint.y)))")
         
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             self.focusedId = newItem.id
@@ -329,32 +375,30 @@ struct ContentView: View {
                 .frame(width: image.size.width, height: image.size.height)
             
             Canvas { context, size in
-                for item in callouts {
+                let baseWidth = max(2.0, size.width * 0.003)
+                let outlineWidth = baseWidth + 3.0
+                
+                let whiteStyle = StrokeStyle(lineWidth: outlineWidth, lineCap: .round, lineJoin: .round)
+                let blackStyle = StrokeStyle(lineWidth: baseWidth, lineCap: .round, lineJoin: .round)
+                
+                for item in callouts where item.hasLeaderLine {
                     let target = CGPoint(
                         x: item.targetNorm.x * size.width,
                         y: item.targetNorm.y * size.height
                     )
-                    let boxCenter = CGPoint(
-                        x: target.x + item.boxOffset.width,
-                        y: target.y + item.boxOffset.height
-                    )
+                    let boxCenter = item.badgeCenter(in: size)
                     
                     var path = Path()
                     path.move(to: target)
                     path.addLine(to: boxCenter)
-                    context.stroke(path, with: .color(.black), lineWidth: max(2, size.width * 0.003))
+                    
+                    context.stroke(path, with: .color(.white), style: whiteStyle)
+                    context.stroke(path, with: .color(.black), style: blackStyle)
                 }
             }
             
             ForEach(callouts) { item in
-                let target = CGPoint(
-                    x: item.targetNorm.x * image.size.width,
-                    y: item.targetNorm.y * image.size.height
-                )
-                let boxCenter = CGPoint(
-                    x: target.x + item.boxOffset.width,
-                    y: target.y + item.boxOffset.height
-                )
+                let boxCenter = item.badgeCenter(in: image.size)
                 
                 CalloutBadgeView(label: item.label)
                     .position(boxCenter)
@@ -391,10 +435,13 @@ struct ContentView: View {
             Divider()
             
             if callouts.isEmpty {
-                Text("Klicke auf Strukturen im Bild, um Marker (A, B, C...) zu setzen.")
-                    .font(.callout)
-                    .foregroundColor(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("• **Klick:** Marker mit Zeigerlinie")
+                    Text("• **⌘ + Klick:** Direkter Kasten ohne Linie")
+                }
+                .font(.callout)
+                .foregroundColor(.secondary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
                     VStack(spacing: 10) {
@@ -402,6 +449,7 @@ struct ContentView: View {
                             HStack(spacing: 8) {
                                 CalloutBadgeView(label: item.label)
                                 
+                                // Einheitlicher Pfeil für alle Marker-Arten
                                 Image(systemName: "arrow.right")
                                     .foregroundColor(.secondary)
                                     .font(.caption)
@@ -467,13 +515,13 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Native AppKit ScrollView mit Overlay-Interaktion
+// MARK: - Native AppKit ScrollView
 struct NativeZoomableScrollView<Content: View>: NSViewRepresentable {
     @Binding var magnification: CGFloat
     let contentSize: CGSize
     let mode: AppMode
     let callouts: [CalloutItem]
-    var onAddCallout: (CGPoint) -> Void
+    var onAddCallout: (CGPoint, Bool) -> Void
     var onUpdateCalloutOffset: (Int, CGSize) -> Void
     var onCropDrag: (CGRect) -> Void
     let content: Content
@@ -483,7 +531,7 @@ struct NativeZoomableScrollView<Content: View>: NSViewRepresentable {
         contentSize: CGSize,
         mode: AppMode,
         callouts: [CalloutItem],
-        onAddCallout: @escaping (CGPoint) -> Void,
+        onAddCallout: @escaping (CGPoint, Bool) -> Void,
         onUpdateCalloutOffset: @escaping (Int, CGSize) -> Void,
         onCropDrag: @escaping (CGRect) -> Void,
         @ViewBuilder content: () -> Content
@@ -513,13 +561,13 @@ struct NativeZoomableScrollView<Content: View>: NSViewRepresentable {
         documentContainer.targetSize = contentSize
         documentContainer.frame = NSRect(origin: .zero, size: contentSize)
 
-        // 1. SwiftUI Host View (Zeichnet das Bild und die Marker)
+        // 1. SwiftUI Host View
         let hostingView = NSHostingView(rootView: content)
         hostingView.frame = NSRect(origin: .zero, size: contentSize)
         hostingView.autoresizingMask = [.width, .height]
         documentContainer.addSubview(hostingView)
 
-        // 2. Native AppKit Interaktions-Ebene (Empfängt Klicks & Drag ohne Zoom-Verzerrung)
+        // 2. Native AppKit Interaktions-Ebene
         let interactionOverlay = CanvasInteractionOverlayView()
         interactionOverlay.frame = NSRect(origin: .zero, size: contentSize)
         interactionOverlay.autoresizingMask = [.width, .height]
@@ -601,14 +649,14 @@ struct NativeZoomableScrollView<Content: View>: NSViewRepresentable {
     }
 }
 
-// MARK: - Native AppKit Interaktions-Overlay (Pixelgenau bei jedem Zoomlevel)
+// MARK: - Native AppKit Interaktions-Overlay
 class CanvasInteractionOverlayView: NSView {
     override var isFlipped: Bool { true }
 
     var contentSize: CGSize = .zero
     var mode: AppMode = .annotate
     var callouts: [CalloutItem] = []
-    var onAddCallout: ((CGPoint) -> Void)?
+    var onAddCallout: ((CGPoint, Bool) -> Void)?
     var onUpdateCalloutOffset: ((Int, CGSize) -> Void)?
     var onCropDrag: ((CGRect) -> Void)?
 
@@ -616,27 +664,25 @@ class CanvasInteractionOverlayView: NSView {
     private var dragStartLoc: CGPoint?
     private var dragStartBoxOffset: CGSize = .zero
     private var isDragging: Bool = false
+    private var isCommandClick: Bool = false
 
     override func mouseDown(with event: NSEvent) {
         let loc = convert(event.locationInWindow, from: nil)
         dragStartLoc = loc
         isDragging = false
         activeDraggedCalloutIndex = nil
+        isCommandClick = event.modifierFlags.contains(.command)
 
         guard contentSize.width > 0, contentSize.height > 0 else { return }
 
         if mode == .annotate {
-            // Prüfen, ob ein Marker-Badge angeklickt wurde (30x30 Klick-Bereich)
             for (idx, item) in callouts.enumerated().reversed() {
-                let badgeCenter = CGPoint(
-                    x: item.targetNorm.x * contentSize.width + item.boxOffset.width,
-                    y: item.targetNorm.y * contentSize.height + item.boxOffset.height
-                )
+                let badgeCenter = item.badgeCenter(in: contentSize)
                 let badgeRect = CGRect(
-                    x: badgeCenter.x - 15,
-                    y: badgeCenter.y - 15,
-                    width: 30,
-                    height: 30
+                    x: badgeCenter.x - 16,
+                    y: badgeCenter.y - 16,
+                    width: 32,
+                    height: 32
                 )
                 if badgeRect.contains(loc) {
                     activeDraggedCalloutIndex = idx
@@ -656,7 +702,6 @@ class CanvasInteractionOverlayView: NSView {
         }
 
         if let draggedIdx = activeDraggedCalloutIndex, mode == .annotate {
-            // Marker verschieben (1:1 am Mauszeiger bei jedem Zoomfaktor)
             let dx = current.x - start.x
             let dy = current.y - start.y
             let newOffset = CGSize(
@@ -665,7 +710,6 @@ class CanvasInteractionOverlayView: NSView {
             )
             onUpdateCalloutOffset?(draggedIdx, newOffset)
         } else if mode == .crop {
-            // Zuschneide-Rechteck ziehen
             let minX = max(0, min(contentSize.width, min(start.x, current.x)))
             let minY = max(0, min(contentSize.height, min(start.y, current.y)))
             let maxX = max(0, min(contentSize.width, max(start.x, current.x)))
@@ -685,17 +729,18 @@ class CanvasInteractionOverlayView: NSView {
         let loc = convert(event.locationInWindow, from: nil)
 
         if mode == .annotate && activeDraggedCalloutIndex == nil && !isDragging {
-            // Neuer Marker durch einfachen Klick
             if contentSize.width > 0, contentSize.height > 0 {
                 let normX = max(0, min(1, loc.x / contentSize.width))
                 let normY = max(0, min(1, loc.y / contentSize.height))
-                onAddCallout?(CGPoint(x: normX, y: normY))
+                let withLeaderLine = !isCommandClick
+                onAddCallout?(CGPoint(x: normX, y: normY), withLeaderLine)
             }
         }
 
         dragStartLoc = nil
         activeDraggedCalloutIndex = nil
         isDragging = false
+        isCommandClick = false
     }
 }
 
@@ -785,6 +830,6 @@ struct CalloutBadgeView: View {
                 Rectangle()
                     .stroke(Color.black, lineWidth: 1.5)
             )
-            .shadow(color: Color.black.opacity(0.2), radius: 2, x: 1, y: 1)
+            .shadow(color: Color.black.opacity(0.25), radius: 2, x: 1, y: 1)
     }
 }
