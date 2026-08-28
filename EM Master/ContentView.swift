@@ -7,6 +7,7 @@ struct CalloutItem: Identifiable, Equatable {
     let id = UUID()
     var index: Int
     var label: String {
+        guard index >= 0 else { return "1" }
         guard index < 26 else { return "\(index + 1)" }
         return String(UnicodeScalar(65 + index)!)
     }
@@ -95,7 +96,7 @@ struct ContentView: View {
                                 addCallout(at: normPoint, withLeaderLine: withLeaderLine)
                             },
                             onUpdateCalloutOffset: { index, newOffset in
-                                if index < callouts.count {
+                                if callouts.indices.contains(index) {
                                     callouts[index].boxOffset = newOffset
                                 }
                             },
@@ -325,6 +326,22 @@ struct ContentView: View {
         }
     }
     
+    // MARK: - Reset State (Sicher gegen Index-Fehler)
+    private func resetApp() {
+        // Erst den First Responder schliessen, damit kein Textfeld mehr aktiv ist
+        NSApp.keyWindow?.makeFirstResponder(nil)
+        self.focusedId = nil
+        
+        withAnimation(.easeInOut(duration: 0.2)) {
+            self.image = nil
+            self.callouts.removeAll()
+            self.magnification = 1.0
+            self.mode = .annotate
+            self.cropRectNorm = CGRect(x: 0.1, y: 0.1, width: 0.8, height: 0.8)
+            self.isCopiedFeedback = false
+        }
+    }
+    
     // MARK: - Pasteboard & Kombinierter RemNote Export
     private func pasteFromClipboard() {
         let pb = NSPasteboard.general
@@ -354,23 +371,27 @@ struct ContentView: View {
         self.callouts.removeAll()
         self.magnification = 1.0
         self.mode = .annotate
+        self.isCopiedFeedback = false
     }
     
-    /// Rendert das annotierte Bild intern als NSImage
+    /// Kopiert Bild + Anki/RemNote-Liste in einem einzigen Schritt in die Zwischenablage und setzt die App sicher zurück
     @MainActor
-    private func renderAnnotatedImage() -> NSImage? {
-        guard let image = image else { return nil }
+    private func copyCombinedToClipboard() {
+        // 1. Textfeld-Fokus sofort beenden
+        NSApp.keyWindow?.makeFirstResponder(nil)
+        self.focusedId = nil
+        
+        guard let currentImage = image, !callouts.isEmpty else { return }
         
         let renderView = ZStack {
-            Image(nsImage: image)
+            Image(nsImage: currentImage)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
-                .frame(width: image.size.width, height: image.size.height)
+                .frame(width: currentImage.size.width, height: currentImage.size.height)
             
             Canvas { context, size in
                 let baseWidth = max(2.0, size.width * 0.003)
                 let outlineWidth = baseWidth + 3.0
-                
                 let whiteStyle = StrokeStyle(lineWidth: outlineWidth, lineCap: .round, lineJoin: .round)
                 let blackStyle = StrokeStyle(lineWidth: baseWidth, lineCap: .round, lineJoin: .round)
                 
@@ -391,30 +412,26 @@ struct ContentView: View {
             }
             
             ForEach(callouts) { item in
-                let boxCenter = item.badgeCenter(in: image.size)
-                
+                let boxCenter = item.badgeCenter(in: currentImage.size)
                 CalloutBadgeView(label: item.label)
                     .position(boxCenter)
             }
         }
-        .frame(width: image.size.width, height: image.size.height)
+        .frame(width: currentImage.size.width, height: currentImage.size.height)
         
         let renderer = ImageRenderer(content: renderView)
         renderer.scale = 2.0
-        return renderer.nsImage
-    }
-    
-    /// Kopiert Bild + Anki/RemNote-Liste in einem einzigen Schritt in die Zwischenablage
-    @MainActor
-    private func copyCombinedToClipboard() {
-        guard let nsImage = renderAnnotatedImage(),
-              let tiffData = nsImage.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiffData),
-              let pngData = bitmap.representation(using: .png, properties: [:]) else { return }
+        
+        // 2. Direktes, stabiles CGImage ohne TIFF-Fehler
+        guard let cgImage = renderer.cgImage else { return }
+        let bitmap = NSBitmapImageRep(cgImage: cgImage)
+        guard let pngData = bitmap.representation(using: .png, properties: [:]) else { return }
+        let nsImage = NSImage(cgImage: cgImage, size: currentImage.size)
+        let tiffData = nsImage.tiffRepresentation ?? pngData
         
         let base64Image = pngData.base64EncodedString()
         
-        // 1. HTML für RemNote, Notion & Web-Editoren
+        // HTML für RemNote / Notion
         let listItemsHtml = callouts.map { item in
             let text = item.text.trimmingCharacters(in: .whitespaces)
             return "<li><strong>\(item.label)</strong> &rarr; \(text)</li>"
@@ -427,13 +444,13 @@ struct ContentView: View {
         </ul>
         """
         
-        // 2. Plain-Text Fallback
+        // Plain-Text Fallback
         let plainText = callouts.map { item in
             let text = item.text.trimmingCharacters(in: .whitespaces)
             return text.isEmpty ? "• \(item.label) →" : "• \(item.label) → \(text)"
         }.joined(separator: "\n")
         
-        // 3. RTFD für native macOS-Apps (Apple Notes, Pages etc.)
+        // RTFD Fallback
         let attrString = NSMutableAttributedString()
         let attachment = NSTextAttachment()
         attachment.image = nsImage
@@ -452,7 +469,6 @@ struct ContentView: View {
             documentAttributes: [.documentType: NSAttributedString.DocumentType.rtfd]
         )
         
-        // Alles in das Pasteboard schreiben
         let pb = NSPasteboard.general
         pb.clearContents()
         
@@ -469,14 +485,14 @@ struct ContentView: View {
         
         pb.writeObjects([pbItem])
         
-        // Feedback-Animation
-        withAnimation(.easeInOut(duration: 0.2)) {
+        // Feedback anzeigen
+        withAnimation(.easeInOut(duration: 0.15)) {
             isCopiedFeedback = true
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
-            withAnimation(.easeInOut(duration: 0.2)) {
-                isCopiedFeedback = false
-            }
+        
+        // Sicheres Reset nach kurzer Pause
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            resetApp()
         }
     }
     
@@ -489,7 +505,7 @@ struct ContentView: View {
                 Spacer()
                 if !callouts.isEmpty {
                     Button("Alle löschen", role: .destructive) {
-                        callouts.removeAll()
+                        resetApp()
                     }
                     .buttonStyle(.plain)
                     .foregroundColor(.red)
@@ -510,23 +526,35 @@ struct ContentView: View {
             } else {
                 ScrollView {
                     VStack(spacing: 10) {
-                        ForEach($callouts) { $item in
-                            HStack(spacing: 8) {
-                                CalloutBadgeView(label: item.label)
-                                
-                                Image(systemName: "arrow.right")
-                                    .foregroundColor(.secondary)
-                                    .font(.caption)
-                                
-                                TextField("Back of card", text: $item.text)
+                        // Absturzsichere Auflistung mit Index-Bounds-Check
+                        ForEach(callouts) { item in
+                            if let idx = callouts.firstIndex(where: { $0.id == item.id }) {
+                                HStack(spacing: 8) {
+                                    CalloutBadgeView(label: item.label)
+                                    
+                                    Image(systemName: "arrow.right")
+                                        .foregroundColor(.secondary)
+                                        .font(.caption)
+                                    
+                                    TextField("Back of card", text: Binding(
+                                        get: {
+                                            guard callouts.indices.contains(idx) else { return "" }
+                                            return callouts[idx].text
+                                        },
+                                        set: { newValue in
+                                            guard callouts.indices.contains(idx) else { return }
+                                            callouts[idx].text = newValue
+                                        }
+                                    ))
                                     .textFieldStyle(.roundedBorder)
                                     .focused($focusedId, equals: item.id)
-                                
-                                Button(action: { removeCallout(id: item.id) }) {
-                                    Image(systemName: "xmark.circle.fill")
-                                        .foregroundColor(.secondary)
+                                    
+                                    Button(action: { removeCallout(id: item.id) }) {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .foregroundColor(.secondary)
+                                    }
+                                    .buttonStyle(.plain)
                                 }
-                                .buttonStyle(.plain)
                             }
                         }
                     }
@@ -536,11 +564,11 @@ struct ContentView: View {
             
             Spacer()
             
-            // EINZIGER EXPORT-BUTTON
+            // EXPORT- UND RESET-BUTTON
             Button(action: copyCombinedToClipboard) {
                 HStack(spacing: 8) {
                     Image(systemName: isCopiedFeedback ? "checkmark.circle.fill" : "doc.on.clipboard.fill")
-                    Text(isCopiedFeedback ? "In RemNote einfügebereit! ✓" : "Bild + Liste für RemNote kopieren")
+                    Text(isCopiedFeedback ? "Kopiert! Bereit für nächstes Bild ✓" : "Bild + Liste für RemNote kopieren")
                         .bold()
                 }
                 .frame(maxWidth: .infinity)
@@ -765,13 +793,15 @@ class CanvasInteractionOverlayView: NSView {
         }
 
         if let draggedIdx = activeDraggedCalloutIndex, mode == .annotate {
-            let dx = current.x - start.x
-            let dy = current.y - start.y
-            let newOffset = CGSize(
-                width: dragStartBoxOffset.width + dx,
-                height: dragStartBoxOffset.height + dy
-            )
-            onUpdateCalloutOffset?(draggedIdx, newOffset)
+            if callouts.indices.contains(draggedIdx) {
+                let dx = current.x - start.x
+                let dy = current.y - start.y
+                let newOffset = CGSize(
+                    width: dragStartBoxOffset.width + dx,
+                    height: dragStartBoxOffset.height + dy
+                )
+                onUpdateCalloutOffset?(draggedIdx, newOffset)
+            }
         } else if mode == .crop {
             let minX = max(0, min(contentSize.width, min(start.x, current.x)))
             let minY = max(0, min(contentSize.height, min(start.y, current.y)))
