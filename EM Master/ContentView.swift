@@ -2,6 +2,16 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
+// MARK: - Hilfserweiterung für auflösungsunabhängige Skalierung
+extension CGSize {
+    /// Berechnet den Skalierungsfaktor für Beschriftungen basierend auf der Bildauflösung (Referenz: 1000px Basisdimension)
+    var calloutScale: CGFloat {
+        guard width > 0, height > 0 else { return 1.0 }
+        let baseDimension = max(width, height)
+        return max(0.4, baseDimension / 1000.0)
+    }
+}
+
 // MARK: - Datenmodell
 struct CalloutItem: Identifiable, Equatable {
     let id = UUID()
@@ -12,13 +22,16 @@ struct CalloutItem: Identifiable, Equatable {
         return String(UnicodeScalar(65 + index)!)
     }
     var targetNorm: CGPoint       // 0.0 ... 1.0
-    var boxOffset: CGSize = CGSize(width: -30, height: -30)
+    var boxOffset: CGSize = CGSize(width: -35, height: -35)
     var text: String = ""
     var hasLeaderLine: Bool = true // true = mit Linie, false = reiner Kasten (⌘+Klick)
     
     /// Berechnet den Mittelpunkt des Badges mit automatischem Abknicken am Rand
-    func badgeCenter(in size: CGSize, badgeRadius: CGFloat = 13) -> CGPoint {
+    func badgeCenter(in size: CGSize) -> CGPoint {
         guard size.width > 0, size.height > 0 else { return .zero }
+        let scale = size.calloutScale
+        let badgeRadius: CGFloat = 14 * scale
+        
         let target = CGPoint(
             x: targetNorm.x * size.width,
             y: targetNorm.y * size.height
@@ -67,6 +80,7 @@ struct ContentView: View {
     
     // Nativer Zoom State
     @State private var magnification: CGFloat = 1.0
+    @State private var triggerFitToScreen: Bool = false
     
     // Crop State
     @State private var mode: AppMode = .annotate
@@ -98,6 +112,8 @@ struct ContentView: View {
                             contentSize: image.size,
                             mode: mode,
                             callouts: callouts,
+                            cropRectNorm: cropRectNorm,
+                            triggerFitToScreen: $triggerFitToScreen,
                             onAddCallout: { normPoint, withLeaderLine in
                                 addCallout(at: normPoint, withLeaderLine: withLeaderLine)
                             },
@@ -110,7 +126,10 @@ struct ContentView: View {
                                 self.cropRectNorm = normRect
                             }
                         ) {
-                            canvasContent(image: image, size: image.size)
+                            // Reines Bild im Hintergrund
+                            Image(nsImage: image)
+                                .resizable()
+                                .frame(width: image.size.width, height: image.size.height)
                         }
                     } else {
                         emptyStateView
@@ -143,7 +162,6 @@ struct ContentView: View {
             // RECHTER BEREICH: Notizen & Kombinierter Export
             sidePanelView
         }
-        // Drag and Drop Unterstützung für Dateien & Bilder
         .onDrop(of: [.image, .fileURL, .png, .tiff, .jpeg], isTargeted: $isDropTargeted) { providers in
             loadFromProviders(providers)
             return true
@@ -159,85 +177,25 @@ struct ContentView: View {
         }
     }
     
-    // MARK: - Tastatur Monitor für zuverlässiges ⌘V
+    // MARK: - Tastatur Monitor für ⌘V
     private func setupGlobalPasteMonitor() {
         if eventMonitor != nil { return }
         
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            // Prüfen ob Command + V gedrückt wurde
             let isCmdV = event.modifierFlags.contains(.command) &&
                          (event.charactersIgnoringModifiers?.lowercased() == "v")
             
             if isCmdV {
-                // Wenn der Fokus in einem Textfeld/Editor liegt, normales Text-Einfügen erlauben
                 if let responder = NSApp.keyWindow?.firstResponder,
                    responder is NSTextView || responder is NSTextField {
                     return event
                 }
                 
-                // Ansonsten Bild aus Zwischenablage einfügen
                 self.pasteFromClipboard()
-                return nil // Event konsumieren
+                return nil
             }
             return event
         }
-    }
-    
-    // MARK: - Bildinhalt
-    @ViewBuilder
-    private func canvasContent(image: NSImage, size: CGSize) -> some View {
-        ZStack(alignment: .topLeading) {
-            // 1. Das REM-Bild
-            Image(nsImage: image)
-                .resizable()
-                .frame(width: size.width, height: size.height)
-            
-            // 2. Verbindungslinien
-            if mode == .annotate {
-                Canvas { context, _ in
-                    let baseWidth = max(1.5, size.width * 0.0015)
-                    let outlineWidth = baseWidth + 2.5
-                    
-                    let whiteStyle = StrokeStyle(lineWidth: outlineWidth, lineCap: .round, lineJoin: .round)
-                    let blackStyle = StrokeStyle(lineWidth: baseWidth, lineCap: .round, lineJoin: .round)
-                    
-                    for item in callouts where item.hasLeaderLine {
-                        let target = CGPoint(
-                            x: item.targetNorm.x * size.width,
-                            y: item.targetNorm.y * size.height
-                        )
-                        let boxCenter = item.badgeCenter(in: size)
-                        
-                        var path = Path()
-                        path.move(to: target)
-                        path.addLine(to: boxCenter)
-                        
-                        context.stroke(path, with: .color(.white), style: whiteStyle)
-                        context.stroke(path, with: .color(.black), style: blackStyle)
-                    }
-                }
-                .frame(width: size.width, height: size.height)
-            }
-            
-            // 3. Buchstaben-Boxen
-            if mode == .annotate {
-                ForEach(callouts) { item in
-                    let currentBoxPos = item.badgeCenter(in: size)
-                    
-                    CalloutBadgeView(label: item.label)
-                        .position(currentBoxPos)
-                }
-            }
-            
-            // 4. Crop-Overlay
-            if mode == .crop {
-                CropOverlayView(
-                    cropRect: cropRectNorm,
-                    containerSize: size
-                )
-            }
-        }
-        .frame(width: size.width, height: size.height)
     }
     
     // MARK: - Toolbar
@@ -252,7 +210,6 @@ struct ContentView: View {
                 }
                 .buttonStyle(.bordered)
                 
-                // LÖSCHEN-BUTTON (Toolbar)
                 Button(role: .destructive, action: resetApp) {
                     Label("Löschen", systemImage: "trash")
                 }
@@ -274,18 +231,18 @@ struct ContentView: View {
             HStack(spacing: 6) {
                 Button(action: {
                     withAnimation(.easeOut(duration: 0.15)) {
-                        magnification = max(0.2, magnification - 0.25)
+                        magnification = max(0.05, magnification - 0.15)
                     }
                 }) {
                     Image(systemName: "minus.magnifyingglass")
                 }
                 
-                Slider(value: $magnification, in: 0.2...5.0)
+                Slider(value: $magnification, in: 0.05...4.0)
                     .frame(width: 80)
                 
                 Button(action: {
                     withAnimation(.easeOut(duration: 0.15)) {
-                        magnification = min(6.0, magnification + 0.25)
+                        magnification = min(6.0, magnification + 0.15)
                     }
                 }) {
                     Image(systemName: "plus.magnifyingglass")
@@ -294,6 +251,12 @@ struct ContentView: View {
                 Text("\(Int(magnification * 100))%")
                     .font(.caption.monospacedDigit())
                     .frame(width: 44, alignment: .trailing)
+                
+                Button("Einpassen") {
+                    triggerFitToScreen = true
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
                 
                 Button("100%") {
                     withAnimation(.easeOut(duration: 0.15)) {
@@ -352,17 +315,20 @@ struct ContentView: View {
         
         self.image = croppedImage
         self.mode = .annotate
-        self.magnification = 1.0
+        self.triggerFitToScreen = true
     }
     
     // MARK: - Marker Management
     private func addCallout(at normPoint: CGPoint, withLeaderLine: Bool) {
+        guard let img = image else { return }
         let nextIndex = callouts.count
+        let scale = img.size.calloutScale
         
         let initialOffset: CGSize
         if withLeaderLine {
-            let initialOffsetX: CGFloat = (normPoint.x < 0.08) ? 35 : -35
-            let initialOffsetY: CGFloat = (normPoint.y < 0.08) ? 35 : -35
+            let dist: CGFloat = 45 * scale
+            let initialOffsetX: CGFloat = (normPoint.x < 0.1) ? dist : -dist
+            let initialOffsetY: CGFloat = (normPoint.y < 0.1) ? dist : -dist
             initialOffset = CGSize(width: initialOffsetX, height: initialOffsetY)
         } else {
             initialOffset = .zero
@@ -390,7 +356,7 @@ struct ContentView: View {
         }
     }
     
-    // MARK: - Reset State (Löscht alles OHNE Zwischenablage)
+    // MARK: - Reset State
     private func resetApp() {
         NSApp.keyWindow?.makeFirstResponder(nil)
         self.focusedId = nil
@@ -409,13 +375,11 @@ struct ContentView: View {
     private func pasteFromClipboard() {
         let pb = NSPasteboard.general
         
-        // 1. Direktes Bild aus Pasteboard
         if let directImage = NSImage(pasteboard: pb) {
             setupNewImage(directImage)
             return
         }
         
-        // 2. Kopierte Datei aus Finder (Dateipfad / URL)
         if let urls = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] {
             for url in urls {
                 if let img = NSImage(contentsOf: url) {
@@ -425,7 +389,6 @@ struct ContentView: View {
             }
         }
         
-        // 3. Fallback über Rohdaten
         let supportedTypes: [NSPasteboard.PasteboardType] = [
             .png,
             .tiff,
@@ -443,7 +406,6 @@ struct ContentView: View {
     private func loadFromProviders(_ providers: [NSItemProvider]) {
         guard let provider = providers.first else { return }
         
-        // 1. Direktes NSImage Objekt
         if provider.canLoadObject(ofClass: NSImage.self) {
             _ = provider.loadObject(ofClass: NSImage.self) { loadedImage, _ in
                 if let img = loadedImage as? NSImage {
@@ -455,7 +417,6 @@ struct ContentView: View {
             return
         }
         
-        // 2. Datei-URL (z. B. aus Finder gezogen)
         if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
             provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
                 var targetURL: URL?
@@ -474,7 +435,6 @@ struct ContentView: View {
             return
         }
         
-        // 3. Allgemeine Bild-Daten (z. B. aus Browser gezogen)
         if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
             provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
                 if let data = data, let img = NSImage(data: data) {
@@ -493,19 +453,20 @@ struct ContentView: View {
         withAnimation(.easeInOut(duration: 0.2)) {
             self.image = img
             self.callouts.removeAll()
-            self.magnification = 1.0
             self.mode = .annotate
             self.isCopiedFeedback = false
+            self.triggerFitToScreen = true
         }
     }
     
-    /// Kopiert Bild + Anki/RemNote-Liste in einem Schritt in die Zwischenablage und setzt die App zurück
+    /// Kopiert Bild + Liste in einem Schritt in die Zwischenablage mit perfekt skalierter Auflösung
     @MainActor
     private func copyCombinedToClipboard() {
         NSApp.keyWindow?.makeFirstResponder(nil)
         self.focusedId = nil
         
         guard let currentImage = image, !callouts.isEmpty else { return }
+        let scale = currentImage.size.calloutScale
         
         let renderView = ZStack {
             Image(nsImage: currentImage)
@@ -514,8 +475,8 @@ struct ContentView: View {
                 .frame(width: currentImage.size.width, height: currentImage.size.height)
             
             Canvas { context, size in
-                let baseWidth = max(2.0, size.width * 0.003)
-                let outlineWidth = baseWidth + 3.0
+                let baseWidth = max(2.0, 2.5 * scale)
+                let outlineWidth = baseWidth + (3.0 * scale)
                 let whiteStyle = StrokeStyle(lineWidth: outlineWidth, lineCap: .round, lineJoin: .round)
                 let blackStyle = StrokeStyle(lineWidth: baseWidth, lineCap: .round, lineJoin: .round)
                 
@@ -537,7 +498,7 @@ struct ContentView: View {
             
             ForEach(callouts) { item in
                 let boxCenter = item.badgeCenter(in: currentImage.size)
-                CalloutBadgeView(label: item.label)
+                CalloutBadgeView(label: item.label, scale: scale)
                     .position(boxCenter)
             }
         }
@@ -554,7 +515,6 @@ struct ContentView: View {
         
         let base64Image = pngData.base64EncodedString()
         
-        // HTML für RemNote / Notion
         let listItemsHtml = callouts.map { item in
             let text = item.text.trimmingCharacters(in: .whitespaces)
             return "<li><strong>\(item.label)</strong> &rarr; \(text)</li>"
@@ -567,13 +527,11 @@ struct ContentView: View {
         </ul>
         """
         
-        // Plain-Text Fallback
         let plainText = callouts.map { item in
             let text = item.text.trimmingCharacters(in: .whitespaces)
             return text.isEmpty ? "• \(item.label) →" : "• \(item.label) → \(text)"
         }.joined(separator: "\n")
         
-        // RTFD Fallback
         let attrString = NSMutableAttributedString()
         let attachment = NSTextAttachment()
         attachment.image = nsImage
@@ -608,12 +566,10 @@ struct ContentView: View {
         
         pb.writeObjects([pbItem])
         
-        // Feedback anzeigen
         withAnimation(.easeInOut(duration: 0.15)) {
             isCopiedFeedback = true
         }
         
-        // Sicheres Reset nach kurzer Pause
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
             resetApp()
         }
@@ -653,7 +609,7 @@ struct ContentView: View {
                         ForEach(callouts) { item in
                             if let idx = callouts.firstIndex(where: { $0.id == item.id }) {
                                 HStack(spacing: 8) {
-                                    CalloutBadgeView(label: item.label)
+                                    CalloutBadgeView(label: item.label, scale: 1.0)
                                     
                                     Image(systemName: "arrow.right")
                                         .foregroundColor(.secondary)
@@ -687,9 +643,8 @@ struct ContentView: View {
             
             Spacer()
             
-            // BUTTON-GRUPPE: EXPORT & LÖSCHEN
+            // BUTTON-GRUPPE
             VStack(spacing: 8) {
-                // Export-Button
                 Button(action: copyCombinedToClipboard) {
                     HStack(spacing: 8) {
                         Image(systemName: isCopiedFeedback ? "checkmark.circle.fill" : "doc.on.clipboard.fill")
@@ -704,7 +659,6 @@ struct ContentView: View {
                 .tint(isCopiedFeedback ? .green : .accentColor)
                 .disabled(image == nil || callouts.isEmpty)
                 
-                // LÖSCHEN-BUTTON (Rechtes Panel)
                 Button(role: .destructive, action: resetApp) {
                     HStack(spacing: 6) {
                         Image(systemName: "trash")
@@ -753,6 +707,8 @@ struct NativeZoomableScrollView<Content: View>: NSViewRepresentable {
     let contentSize: CGSize
     let mode: AppMode
     let callouts: [CalloutItem]
+    let cropRectNorm: CGRect
+    @Binding var triggerFitToScreen: Bool
     var onAddCallout: (CGPoint, Bool) -> Void
     var onUpdateCalloutOffset: (Int, CGSize) -> Void
     var onCropDrag: (CGRect) -> Void
@@ -763,6 +719,8 @@ struct NativeZoomableScrollView<Content: View>: NSViewRepresentable {
         contentSize: CGSize,
         mode: AppMode,
         callouts: [CalloutItem],
+        cropRectNorm: CGRect,
+        triggerFitToScreen: Binding<Bool>,
         onAddCallout: @escaping (CGPoint, Bool) -> Void,
         onUpdateCalloutOffset: @escaping (Int, CGSize) -> Void,
         onCropDrag: @escaping (CGRect) -> Void,
@@ -772,6 +730,8 @@ struct NativeZoomableScrollView<Content: View>: NSViewRepresentable {
         self.contentSize = contentSize
         self.mode = mode
         self.callouts = callouts
+        self.cropRectNorm = cropRectNorm
+        self._triggerFitToScreen = triggerFitToScreen
         self.onAddCallout = onAddCallout
         self.onUpdateCalloutOffset = onUpdateCalloutOffset
         self.onCropDrag = onCropDrag
@@ -782,7 +742,7 @@ struct NativeZoomableScrollView<Content: View>: NSViewRepresentable {
         let scrollView = NSScrollView()
         scrollView.contentView = CenteringClipView()
         scrollView.allowsMagnification = true
-        scrollView.minMagnification = 0.2
+        scrollView.minMagnification = 0.05
         scrollView.maxMagnification = 8.0
         scrollView.hasHorizontalScroller = true
         scrollView.hasVerticalScroller = true
@@ -791,21 +751,19 @@ struct NativeZoomableScrollView<Content: View>: NSViewRepresentable {
 
         let documentContainer = FlippedDocumentContainerView()
         documentContainer.targetSize = contentSize
-        documentContainer.frame = NSRect(origin: .zero, size: contentSize)
 
-        // 1. SwiftUI Host View
         let hostingView = NSHostingView(rootView: content)
+        hostingView.translatesAutoresizingMaskIntoConstraints = true
         hostingView.frame = NSRect(origin: .zero, size: contentSize)
-        hostingView.autoresizingMask = [.width, .height]
         documentContainer.addSubview(hostingView)
 
-        // 2. Native AppKit Interaktions-Ebene
         let interactionOverlay = CanvasInteractionOverlayView()
+        interactionOverlay.translatesAutoresizingMaskIntoConstraints = true
         interactionOverlay.frame = NSRect(origin: .zero, size: contentSize)
-        interactionOverlay.autoresizingMask = [.width, .height]
         interactionOverlay.contentSize = contentSize
         interactionOverlay.mode = mode
         interactionOverlay.callouts = callouts
+        interactionOverlay.cropRectNorm = cropRectNorm
         interactionOverlay.onAddCallout = onAddCallout
         interactionOverlay.onUpdateCalloutOffset = onUpdateCalloutOffset
         interactionOverlay.onCropDrag = onCropDrag
@@ -817,6 +775,7 @@ struct NativeZoomableScrollView<Content: View>: NSViewRepresentable {
         context.coordinator.hostingView = hostingView
         context.coordinator.interactionOverlay = interactionOverlay
         context.coordinator.scrollView = scrollView
+        context.coordinator.lastContentSize = contentSize
 
         NotificationCenter.default.addObserver(
             context.coordinator,
@@ -824,6 +783,10 @@ struct NativeZoomableScrollView<Content: View>: NSViewRepresentable {
             name: NSScrollView.didEndLiveMagnifyNotification,
             object: scrollView
         )
+
+        DispatchQueue.main.async {
+            context.coordinator.zoomToFit(animated: false)
+        }
 
         return scrollView
     }
@@ -844,15 +807,24 @@ struct NativeZoomableScrollView<Content: View>: NSViewRepresentable {
             overlay.contentSize = contentSize
             overlay.mode = mode
             overlay.callouts = callouts
+            overlay.cropRectNorm = cropRectNorm
             overlay.onAddCallout = onAddCallout
             overlay.onUpdateCalloutOffset = onUpdateCalloutOffset
             overlay.onCropDrag = onCropDrag
             if overlay.frame.size != contentSize {
                 overlay.frame = NSRect(origin: .zero, size: contentSize)
             }
+            overlay.needsDisplay = true
         }
         
-        if abs(nsView.magnification - magnification) > 0.01 {
+        // Neues Bild oder Größenänderung -> automatisch einpassen
+        if context.coordinator.lastContentSize != contentSize || triggerFitToScreen {
+            context.coordinator.lastContentSize = contentSize
+            DispatchQueue.main.async {
+                self.triggerFitToScreen = false
+                context.coordinator.zoomToFit(animated: true)
+            }
+        } else if abs(nsView.magnification - magnification) > 0.01 {
             nsView.animator().magnification = magnification
         }
     }
@@ -867,9 +839,39 @@ struct NativeZoomableScrollView<Content: View>: NSViewRepresentable {
         var hostingView: NSHostingView<Content>?
         var interactionOverlay: CanvasInteractionOverlayView?
         weak var scrollView: NSScrollView?
+        var lastContentSize: CGSize = .zero
 
         init(_ parent: NativeZoomableScrollView) {
             self.parent = parent
+        }
+
+        func zoomToFit(animated: Bool = false) {
+            guard let sv = scrollView, parent.contentSize.width > 0, parent.contentSize.height > 0 else { return }
+            
+            let viewportSize = sv.contentView.frame.size
+            guard viewportSize.width > 30, viewportSize.height > 30 else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                    self?.zoomToFit(animated: animated)
+                }
+                return
+            }
+
+            let margin: CGFloat = 32.0
+            let availW = max(10, viewportSize.width - margin)
+            let availH = max(10, viewportSize.height - margin)
+
+            let scaleX = availW / parent.contentSize.width
+            let scaleY = availH / parent.contentSize.height
+            let fitScale = min(scaleX, scaleY)
+            let finalScale = max(sv.minMagnification, min(fitScale, sv.maxMagnification))
+
+            if animated {
+                sv.animator().magnification = finalScale
+            } else {
+                sv.magnification = finalScale
+            }
+
+            self.parent.magnification = finalScale
         }
 
         @objc func magnifyDidChange(_ notification: Notification) {
@@ -881,13 +883,23 @@ struct NativeZoomableScrollView<Content: View>: NSViewRepresentable {
     }
 }
 
-// MARK: - Native AppKit Interaktions-Overlay
+// MARK: - Native AppKit Interaktions- & Zeichen-Overlay (100% CoreGraphics, kein Clipping-Bug)
 class CanvasInteractionOverlayView: NSView {
     override var isFlipped: Bool { true }
 
-    var contentSize: CGSize = .zero
-    var mode: AppMode = .annotate
-    var callouts: [CalloutItem] = []
+    var contentSize: CGSize = .zero {
+        didSet { if oldValue != contentSize { needsDisplay = true } }
+    }
+    var mode: AppMode = .annotate {
+        didSet { if oldValue != mode { needsDisplay = true } }
+    }
+    var callouts: [CalloutItem] = [] {
+        didSet { needsDisplay = true }
+    }
+    var cropRectNorm: CGRect = CGRect(x: 0.1, y: 0.1, width: 0.8, height: 0.8) {
+        didSet { needsDisplay = true }
+    }
+
     var onAddCallout: ((CGPoint, Bool) -> Void)?
     var onUpdateCalloutOffset: ((Int, CGSize) -> Void)?
     var onCropDrag: ((CGRect) -> Void)?
@@ -897,6 +909,131 @@ class CanvasInteractionOverlayView: NSView {
     private var dragStartBoxOffset: CGSize = .zero
     private var isDragging: Bool = false
     private var isCommandClick: Bool = false
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard contentSize.width > 0, contentSize.height > 0 else { return }
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        
+        let scale = contentSize.calloutScale
+        
+        if mode == .annotate {
+            let baseWidth = max(2.0, 2.5 * scale)
+            let outlineWidth = baseWidth + (3.0 * scale)
+            
+            context.setLineCap(.round)
+            context.setLineJoin(.round)
+            
+            // 1. Verbindungslinien - Weißer Umriss
+            context.setStrokeColor(NSColor.white.cgColor)
+            context.setLineWidth(outlineWidth)
+            for item in callouts where item.hasLeaderLine {
+                let target = CGPoint(
+                    x: item.targetNorm.x * contentSize.width,
+                    y: item.targetNorm.y * contentSize.height
+                )
+                let boxCenter = item.badgeCenter(in: contentSize)
+                
+                context.beginPath()
+                context.move(to: target)
+                context.addLine(to: boxCenter)
+                context.strokePath()
+            }
+            
+            // 2. Verbindungslinien - Schwarzer Kern
+            context.setStrokeColor(NSColor.black.cgColor)
+            context.setLineWidth(baseWidth)
+            for item in callouts where item.hasLeaderLine {
+                let target = CGPoint(
+                    x: item.targetNorm.x * contentSize.width,
+                    y: item.targetNorm.y * contentSize.height
+                )
+                let boxCenter = item.badgeCenter(in: contentSize)
+                
+                context.beginPath()
+                context.move(to: target)
+                context.addLine(to: boxCenter)
+                context.strokePath()
+            }
+            
+            // 3. Buchstaben-Kästen (Badges) zeichnen
+            let badgeSize: CGFloat = 24 * scale
+            let halfSize = badgeSize / 2.0
+            let fontSize: CGFloat = 15 * scale
+            let borderWidth: CGFloat = max(1.5, 1.5 * scale)
+            
+            let font = NSFont.boldSystemFont(ofSize: fontSize)
+            let textAttributes: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: NSColor.black
+            ]
+            
+            for item in callouts {
+                let center = item.badgeCenter(in: contentSize)
+                let badgeRect = CGRect(
+                    x: center.x - halfSize,
+                    y: center.y - halfSize,
+                    width: badgeSize,
+                    height: badgeSize
+                )
+                
+                // Schatten
+                context.saveGState()
+                context.setShadow(
+                    offset: CGSize(width: 1 * scale, height: 1 * scale),
+                    blur: 2 * scale,
+                    color: NSColor.black.withAlphaComponent(0.25).cgColor
+                )
+                
+                // Weißer Kasten (deckt Linienende sauber ab)
+                context.setFillColor(NSColor.white.cgColor)
+                context.fill(badgeRect)
+                context.restoreGState()
+                
+                // Schwarzer Rahmen
+                context.setStrokeColor(NSColor.black.cgColor)
+                context.setLineWidth(borderWidth)
+                context.stroke(badgeRect)
+                
+                // Zentrierter Text
+                let str = NSString(string: item.label)
+                let textSize = str.size(withAttributes: textAttributes)
+                let textRect = CGRect(
+                    x: badgeRect.midX - textSize.width / 2.0,
+                    y: badgeRect.midY - textSize.height / 2.0,
+                    width: textSize.width,
+                    height: textSize.height
+                )
+                str.draw(in: textRect, withAttributes: textAttributes)
+            }
+        } else if mode == .crop {
+            // 4. Crop-Overlay
+            let pixelRect = CGRect(
+                x: cropRectNorm.origin.x * contentSize.width,
+                y: cropRectNorm.origin.y * contentSize.height,
+                width: cropRectNorm.size.width * contentSize.width,
+                height: cropRectNorm.size.height * contentSize.height
+            )
+            
+            context.setFillColor(NSColor.black.withAlphaComponent(0.45).cgColor)
+            
+            // Oben
+            context.fill(CGRect(x: 0, y: 0, width: contentSize.width, height: pixelRect.minY))
+            // Unten
+            context.fill(CGRect(x: 0, y: pixelRect.maxY, width: contentSize.width, height: contentSize.height - pixelRect.maxY))
+            // Links
+            context.fill(CGRect(x: 0, y: pixelRect.minY, width: pixelRect.minX, height: pixelRect.height))
+            // Rechts
+            context.fill(CGRect(x: pixelRect.maxX, y: pixelRect.minY, width: contentSize.width - pixelRect.maxX, height: pixelRect.height))
+            
+            // Gestrichelter Rahmen
+            context.setStrokeColor(NSColor.white.cgColor)
+            context.setLineWidth(2)
+            let dashes: [CGFloat] = [6, 6]
+            context.setLineDash(phase: 0, lengths: dashes)
+            context.stroke(pixelRect)
+        }
+    }
 
     override func mouseDown(with event: NSEvent) {
         let loc = convert(event.locationInWindow, from: nil)
@@ -908,13 +1045,17 @@ class CanvasInteractionOverlayView: NSView {
         guard contentSize.width > 0, contentSize.height > 0 else { return }
 
         if mode == .annotate {
+            let scale = contentSize.calloutScale
+            let hitSize = max(32.0, 32.0 * scale)
+            let halfHit = hitSize / 2.0
+            
             for (idx, item) in callouts.enumerated().reversed() {
                 let badgeCenter = item.badgeCenter(in: contentSize)
                 let badgeRect = CGRect(
-                    x: badgeCenter.x - 16,
-                    y: badgeCenter.y - 16,
-                    width: 32,
-                    height: 32
+                    x: badgeCenter.x - halfHit,
+                    y: badgeCenter.y - halfHit,
+                    width: hitSize,
+                    height: hitSize
                 )
                 if badgeRect.contains(loc) {
                     activeDraggedCalloutIndex = idx
@@ -941,6 +1082,8 @@ class CanvasInteractionOverlayView: NSView {
                     width: dragStartBoxOffset.width + dx,
                     height: dragStartBoxOffset.height + dy
                 )
+                callouts[draggedIdx].boxOffset = newOffset
+                needsDisplay = true
                 onUpdateCalloutOffset?(draggedIdx, newOffset)
             }
         } else if mode == .crop {
@@ -955,6 +1098,8 @@ class CanvasInteractionOverlayView: NSView {
                 width: max(0.02, (maxX - minX) / contentSize.width),
                 height: max(0.02, (maxY - minY) / contentSize.height)
             )
+            self.cropRectNorm = normRect
+            needsDisplay = true
             onCropDrag?(normRect)
         }
     }
@@ -964,10 +1109,12 @@ class CanvasInteractionOverlayView: NSView {
 
         if mode == .annotate && activeDraggedCalloutIndex == nil && !isDragging {
             if contentSize.width > 0, contentSize.height > 0 {
-                let normX = max(0, min(1, loc.x / contentSize.width))
-                let normY = max(0, min(1, loc.y / contentSize.height))
-                let withLeaderLine = !isCommandClick
-                onAddCallout?(CGPoint(x: normX, y: normY), withLeaderLine)
+                if loc.x >= 0 && loc.x <= contentSize.width && loc.y >= 0 && loc.y <= contentSize.height {
+                    let normX = loc.x / contentSize.width
+                    let normY = loc.y / contentSize.height
+                    let withLeaderLine = !isCommandClick
+                    onAddCallout?(CGPoint(x: normX, y: normY), withLeaderLine)
+                }
             }
         }
 
@@ -984,13 +1131,32 @@ class FlippedDocumentContainerView: NSView {
 
     var targetSize: NSSize = .zero {
         didSet {
-            frame = NSRect(origin: .zero, size: targetSize)
+            super.setFrameSize(targetSize)
             invalidateIntrinsicContentSize()
+            needsLayout = true
         }
     }
     
     override var intrinsicContentSize: NSSize {
         return targetSize
+    }
+    
+    override func setFrameSize(_ newSize: NSSize) {
+        if targetSize != .zero {
+            super.setFrameSize(targetSize)
+        } else {
+            super.setFrameSize(newSize)
+        }
+    }
+    
+    override func layout() {
+        super.layout()
+        guard targetSize != .zero else { return }
+        for subview in subviews {
+            if subview.frame.size != targetSize || subview.frame.origin != .zero {
+                subview.frame = NSRect(origin: .zero, size: targetSize)
+            }
+        }
     }
 }
 
@@ -1015,55 +1181,25 @@ class CenteringClipView: NSClipView {
     }
 }
 
-// MARK: - Crop Overlay
-struct CropOverlayView: View {
-    let cropRect: CGRect
-    let containerSize: CGSize
-    
-    var body: some View {
-        let pixelRect = CGRect(
-            x: cropRect.origin.x * containerSize.width,
-            y: cropRect.origin.y * containerSize.height,
-            width: cropRect.size.width * containerSize.width,
-            height: cropRect.size.height * containerSize.height
-        )
-        
-        ZStack {
-            Rectangle()
-                .fill(Color.black.opacity(0.45))
-                .mask(
-                    Rectangle()
-                        .overlay(
-                            Rectangle()
-                                .frame(width: pixelRect.width, height: pixelRect.height)
-                                .position(x: pixelRect.midX, y: pixelRect.midY)
-                                .blendMode(.destinationOut)
-                        )
-                )
-            
-            Rectangle()
-                .strokeBorder(Color.white, style: StrokeStyle(lineWidth: 2, dash: [6]))
-                .frame(width: pixelRect.width, height: pixelRect.height)
-                .position(x: pixelRect.midX, y: pixelRect.midY)
-        }
-        .allowsHitTesting(false)
-    }
-}
-
-// MARK: - Badge View
+// MARK: - Skalierbare Badge View (für Export & Seitenleiste)
 struct CalloutBadgeView: View {
     let label: String
+    var scale: CGFloat = 1.0
     
     var body: some View {
+        let size: CGFloat = 24 * scale
+        let fontSize: CGFloat = 15 * scale
+        let lineWidth: CGFloat = max(1.5, 1.5 * scale)
+        
         Text(label)
-            .font(.system(size: 14, weight: .bold, design: .default))
+            .font(.system(size: fontSize, weight: .bold, design: .default))
             .foregroundColor(.black)
-            .frame(width: 22, height: 22)
+            .frame(width: size, height: size)
             .background(Color.white)
             .overlay(
                 Rectangle()
-                    .stroke(Color.black, lineWidth: 1.5)
+                    .stroke(Color.black, lineWidth: lineWidth)
             )
-            .shadow(color: Color.black.opacity(0.25), radius: 2, x: 1, y: 1)
+            .shadow(color: Color.black.opacity(0.25), radius: 2 * scale, x: 1 * scale, y: 1 * scale)
     }
 }
