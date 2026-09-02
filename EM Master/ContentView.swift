@@ -75,6 +75,12 @@ struct ContentView: View {
     // Feedback nach dem Kopieren
     @State private var isCopiedFeedback: Bool = false
     
+    // Drag & Drop State
+    @State private var isDropTargeted: Bool = false
+    
+    // Tastatur-Event Monitor Token
+    @State private var eventMonitor: Any? = nil
+    
     var body: some View {
         HSplitView {
             // LINKER BEREICH: Toolbar & Nativer Zoom Canvas
@@ -109,6 +115,27 @@ struct ContentView: View {
                     } else {
                         emptyStateView
                     }
+                    
+                    // Visueller Drag & Drop Indikator
+                    if isDropTargeted {
+                        ZStack {
+                            Color.accentColor.opacity(0.12)
+                            RoundedRectangle(cornerRadius: 12)
+                                .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 3, dash: [8]))
+                                .padding(16)
+                            
+                            VStack(spacing: 8) {
+                                Image(systemName: "arrow.down.doc.fill")
+                                    .font(.system(size: 44))
+                                    .foregroundColor(.accentColor)
+                                Text("Bild hier ablegen")
+                                    .font(.title2.bold())
+                                    .foregroundColor(.accentColor)
+                            }
+                        }
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                    }
                 }
             }
             .frame(minWidth: 520, minHeight: 480)
@@ -116,11 +143,43 @@ struct ContentView: View {
             // RECHTER BEREICH: Notizen & Kombinierter Export
             sidePanelView
         }
-        .onPasteCommand(of: [.png, .tiff]) { providers in
-            loadImage(from: providers)
+        // Drag and Drop Unterstützung für Dateien & Bilder
+        .onDrop(of: [.image, .fileURL, .png, .tiff, .jpeg], isTargeted: $isDropTargeted) { providers in
+            loadFromProviders(providers)
+            return true
         }
         .onAppear {
+            setupGlobalPasteMonitor()
             pasteFromClipboard()
+        }
+        .onDisappear {
+            if let monitor = eventMonitor {
+                NSEvent.removeMonitor(monitor)
+            }
+        }
+    }
+    
+    // MARK: - Tastatur Monitor für zuverlässiges ⌘V
+    private func setupGlobalPasteMonitor() {
+        if eventMonitor != nil { return }
+        
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // Prüfen ob Command + V gedrückt wurde
+            let isCmdV = event.modifierFlags.contains(.command) &&
+                         (event.charactersIgnoringModifiers?.lowercased() == "v")
+            
+            if isCmdV {
+                // Wenn der Fokus in einem Textfeld/Editor liegt, normales Text-Einfügen erlauben
+                if let responder = NSApp.keyWindow?.firstResponder,
+                   responder is NSTextView || responder is NSTextField {
+                    return event
+                }
+                
+                // Ansonsten Bild aus Zwischenablage einfügen
+                self.pasteFromClipboard()
+                return nil // Event konsumieren
+            }
+            return event
         }
     }
     
@@ -190,6 +249,12 @@ struct ContentView: View {
                     cropRectNorm = CGRect(x: 0.1, y: 0.1, width: 0.8, height: 0.8)
                 }) {
                     Label("Zuschneiden", systemImage: "crop")
+                }
+                .buttonStyle(.bordered)
+                
+                // LÖSCHEN-BUTTON (Toolbar)
+                Button(role: .destructive, action: resetApp) {
+                    Label("Löschen", systemImage: "trash")
                 }
                 .buttonStyle(.bordered)
             } else {
@@ -292,7 +357,6 @@ struct ContentView: View {
     
     // MARK: - Marker Management
     private func addCallout(at normPoint: CGPoint, withLeaderLine: Bool) {
-        guard let img = image else { return }
         let nextIndex = callouts.count
         
         let initialOffset: CGSize
@@ -326,9 +390,8 @@ struct ContentView: View {
         }
     }
     
-    // MARK: - Reset State (Sicher gegen Index-Fehler)
+    // MARK: - Reset State (Löscht alles OHNE Zwischenablage)
     private func resetApp() {
-        // Erst den First Responder schliessen, damit kein Textfeld mehr aktiv ist
         NSApp.keyWindow?.makeFirstResponder(nil)
         self.focusedId = nil
         
@@ -342,21 +405,81 @@ struct ContentView: View {
         }
     }
     
-    // MARK: - Pasteboard & Kombinierter RemNote Export
+    // MARK: - Pasteboard & Drag-and-Drop Loader
     private func pasteFromClipboard() {
         let pb = NSPasteboard.general
-        if let data = pb.data(forType: .png) ?? pb.data(forType: .tiff),
-           let newImage = NSImage(data: data) {
-            setupNewImage(newImage)
+        
+        // 1. Direktes Bild aus Pasteboard
+        if let directImage = NSImage(pasteboard: pb) {
+            setupNewImage(directImage)
+            return
+        }
+        
+        // 2. Kopierte Datei aus Finder (Dateipfad / URL)
+        if let urls = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] {
+            for url in urls {
+                if let img = NSImage(contentsOf: url) {
+                    setupNewImage(img)
+                    return
+                }
+            }
+        }
+        
+        // 3. Fallback über Rohdaten
+        let supportedTypes: [NSPasteboard.PasteboardType] = [
+            .png,
+            .tiff,
+            NSPasteboard.PasteboardType("public.jpeg"),
+            NSPasteboard.PasteboardType("public.heic")
+        ]
+        for type in supportedTypes {
+            if let data = pb.data(forType: type), let img = NSImage(data: data) {
+                setupNewImage(img)
+                return
+            }
         }
     }
     
-    private func loadImage(from providers: [NSItemProvider]) {
-        if let provider = providers.first {
-            provider.loadDataRepresentation(forTypeIdentifier: "public.image") { data, _ in
-                if let data = data, let newImage = NSImage(data: data) {
+    private func loadFromProviders(_ providers: [NSItemProvider]) {
+        guard let provider = providers.first else { return }
+        
+        // 1. Direktes NSImage Objekt
+        if provider.canLoadObject(ofClass: NSImage.self) {
+            _ = provider.loadObject(ofClass: NSImage.self) { loadedImage, _ in
+                if let img = loadedImage as? NSImage {
                     DispatchQueue.main.async {
-                        self.setupNewImage(newImage)
+                        self.setupNewImage(img)
+                    }
+                }
+            }
+            return
+        }
+        
+        // 2. Datei-URL (z. B. aus Finder gezogen)
+        if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                var targetURL: URL?
+                if let url = item as? URL {
+                    targetURL = url
+                } else if let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) {
+                    targetURL = url
+                }
+                
+                if let url = targetURL, let img = NSImage(contentsOf: url) {
+                    DispatchQueue.main.async {
+                        self.setupNewImage(img)
+                    }
+                }
+            }
+            return
+        }
+        
+        // 3. Allgemeine Bild-Daten (z. B. aus Browser gezogen)
+        if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+            provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
+                if let data = data, let img = NSImage(data: data) {
+                    DispatchQueue.main.async {
+                        self.setupNewImage(img)
                     }
                 }
             }
@@ -367,17 +490,18 @@ struct ContentView: View {
         if let rep = img.representations.first, rep.pixelsWide > 0, rep.pixelsHigh > 0 {
             img.size = NSSize(width: rep.pixelsWide, height: rep.pixelsHigh)
         }
-        self.image = img
-        self.callouts.removeAll()
-        self.magnification = 1.0
-        self.mode = .annotate
-        self.isCopiedFeedback = false
+        withAnimation(.easeInOut(duration: 0.2)) {
+            self.image = img
+            self.callouts.removeAll()
+            self.magnification = 1.0
+            self.mode = .annotate
+            self.isCopiedFeedback = false
+        }
     }
     
-    /// Kopiert Bild + Anki/RemNote-Liste in einem einzigen Schritt in die Zwischenablage und setzt die App sicher zurück
+    /// Kopiert Bild + Anki/RemNote-Liste in einem Schritt in die Zwischenablage und setzt die App zurück
     @MainActor
     private func copyCombinedToClipboard() {
-        // 1. Textfeld-Fokus sofort beenden
         NSApp.keyWindow?.makeFirstResponder(nil)
         self.focusedId = nil
         
@@ -422,7 +546,6 @@ struct ContentView: View {
         let renderer = ImageRenderer(content: renderView)
         renderer.scale = 2.0
         
-        // 2. Direktes, stabiles CGImage ohne TIFF-Fehler
         guard let cgImage = renderer.cgImage else { return }
         let bitmap = NSBitmapImageRep(cgImage: cgImage)
         guard let pngData = bitmap.representation(using: .png, properties: [:]) else { return }
@@ -504,8 +627,8 @@ struct ContentView: View {
                     .font(.headline)
                 Spacer()
                 if !callouts.isEmpty {
-                    Button("Alle löschen", role: .destructive) {
-                        resetApp()
+                    Button("Marker leeren", role: .destructive) {
+                        self.callouts.removeAll()
                     }
                     .buttonStyle(.plain)
                     .foregroundColor(.red)
@@ -519,6 +642,7 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("• **Klick:** Marker mit Zeigerlinie")
                     Text("• **⌘ + Klick:** Direkter Kasten ohne Linie")
+                    Text("• **Drag & Drop:** Bild direkt reinziehen")
                 }
                 .font(.callout)
                 .foregroundColor(.secondary)
@@ -526,7 +650,6 @@ struct ContentView: View {
             } else {
                 ScrollView {
                     VStack(spacing: 10) {
-                        // Absturzsichere Auflistung mit Index-Bounds-Check
                         ForEach(callouts) { item in
                             if let idx = callouts.firstIndex(where: { $0.id == item.id }) {
                                 HStack(spacing: 8) {
@@ -564,20 +687,36 @@ struct ContentView: View {
             
             Spacer()
             
-            // EXPORT- UND RESET-BUTTON
-            Button(action: copyCombinedToClipboard) {
-                HStack(spacing: 8) {
-                    Image(systemName: isCopiedFeedback ? "checkmark.circle.fill" : "doc.on.clipboard.fill")
-                    Text(isCopiedFeedback ? "Kopiert! Bereit für nächstes Bild ✓" : "Bild + Liste für RemNote kopieren")
-                        .bold()
+            // BUTTON-GRUPPE: EXPORT & LÖSCHEN
+            VStack(spacing: 8) {
+                // Export-Button
+                Button(action: copyCombinedToClipboard) {
+                    HStack(spacing: 8) {
+                        Image(systemName: isCopiedFeedback ? "checkmark.circle.fill" : "doc.on.clipboard.fill")
+                        Text(isCopiedFeedback ? "Kopiert! Bereit für nächstes Bild ✓" : "Bild + Liste für RemNote kopieren")
+                            .bold()
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 4)
                 }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 4)
+                .controlSize(.large)
+                .buttonStyle(.borderedProminent)
+                .tint(isCopiedFeedback ? .green : .accentColor)
+                .disabled(image == nil || callouts.isEmpty)
+                
+                // LÖSCHEN-BUTTON (Rechtes Panel)
+                Button(role: .destructive, action: resetApp) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "trash")
+                        Text("Löschen")
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 2)
+                }
+                .controlSize(.large)
+                .buttonStyle(.bordered)
+                .disabled(image == nil && callouts.isEmpty)
             }
-            .controlSize(.large)
-            .buttonStyle(.borderedProminent)
-            .tint(isCopiedFeedback ? .green : .accentColor)
-            .disabled(image == nil || callouts.isEmpty)
         }
         .padding(14)
         .frame(minWidth: 280, maxWidth: 360)
@@ -592,11 +731,13 @@ struct ContentView: View {
             Text("Kein Bild geladen")
                 .font(.title2)
                 .bold()
-            Text("Kopiere ein REM-Bild in die Zwischenablage und drücke **⌘V** oder klicke unten.")
+            Text("Drücke **⌘V**, ziehe ein Bild per **Drag & Drop** hierher oder klicke unten.")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 20)
             
-            Button("Bild aus Zwischenablage einfügen") {
+            Button("Bild aus Zwischenablage einfügen (⌘V)") {
                 pasteFromClipboard()
             }
             .controlSize(.large)
