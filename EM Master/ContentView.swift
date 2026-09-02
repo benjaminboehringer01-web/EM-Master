@@ -76,7 +76,7 @@ enum AppMode {
 struct ContentView: View {
     @State private var image: NSImage? = nil
     @State private var callouts: [CalloutItem] = []
-    @State private var overviewText: String = "" // NEU: Optionale Karte "Was sieht man?"
+    @State private var overviewText: String = "" // Optionale Karte "Was sieht man?"
     @FocusState private var focusedId: UUID?
     @FocusState private var isOverviewFocused: Bool
     
@@ -619,8 +619,8 @@ struct ContentView: View {
             Divider()
             
             ScrollView {
-                VStack(alignment: .leading, spacing: 10) {
-                    // NEU: Die permanente "Was sieht man?" Zeile ganz oben
+                VStack(alignment: .leading, spacing: 12) {
+                    // Elegante "Was sieht man?" Zeile
                     overviewCardRow
                     
                     if !callouts.isEmpty {
@@ -631,12 +631,10 @@ struct ContentView: View {
                     // Dynamische Liste der Marker (A, B, C...)
                     ForEach(callouts) { item in
                         if let idx = callouts.firstIndex(where: { $0.id == item.id }) {
-                            HStack(spacing: 8) {
+                            HStack(spacing: 10) {
                                 CalloutBadgeView(label: item.label, scale: 1.0)
                                 
-                                Image(systemName: "arrow.right")
-                                    .foregroundColor(.secondary)
-                                    .font(.caption)
+                                RemArrowView()
                                 
                                 TextField("Back of card", text: Binding(
                                     get: {
@@ -672,7 +670,8 @@ struct ContentView: View {
                         .padding(.top, 12)
                     }
                 }
-                .padding(.vertical, 4)
+                .padding(.horizontal, 4) // Verhindert Rand-Clipping links
+                .padding(.vertical, 6)
             }
             
             Spacer()
@@ -709,29 +708,35 @@ struct ContentView: View {
             }
         }
         .padding(14)
-        .frame(minWidth: 290, maxWidth: 380)
+        .frame(minWidth: 310, maxWidth: 390)
         .background(Color(nsColor: .windowBackgroundColor))
     }
     
-    // MARK: - Zeile für "Was sieht man?"
+    // MARK: - Schöne, moderne Zeile für "Was sieht man?"
     private var overviewCardRow: some View {
-        HStack(spacing: 8) {
-            Text("Was sieht man?")
-                .font(.system(size: 11, weight: .bold))
-                .foregroundColor(.black)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 4)
-                .background(Color.white)
-                .overlay(
-                    Rectangle()
-                        .stroke(Color.black, lineWidth: 1.5)
-                )
-                .shadow(color: Color.black.opacity(0.15), radius: 1, x: 1, y: 1)
-                .fixedSize()
+        HStack(spacing: 10) {
+            HStack(spacing: 5) {
+                Image(systemName: "eye.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.secondary)
+                Text("Was sieht man?")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.primary)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color(nsColor: .controlBackgroundColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.15), lineWidth: 1)
+            )
+            .shadow(color: Color.black.opacity(0.04), radius: 2, x: 0, y: 1)
+            .fixedSize()
             
-            Image(systemName: "arrow.right")
-                .foregroundColor(.secondary)
-                .font(.caption)
+            RemArrowView()
             
             TextField("Back of card (optional)", text: $overviewText)
                 .textFieldStyle(.roundedBorder)
@@ -768,6 +773,17 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+// MARK: - RemNote Typografischer Pfeil
+struct RemArrowView: View {
+    var body: some View {
+        Text("→")
+            .font(.system(size: 15, weight: .bold, design: .rounded))
+            .foregroundColor(.primary.opacity(0.65))
+            .frame(width: 14)
+            .fixedSize()
     }
 }
 
@@ -816,8 +832,7 @@ struct NativeZoomableScrollView<Content: View>: NSViewRepresentable {
         scrollView.maxMagnification = 8.0
         scrollView.hasHorizontalScroller = true
         scrollView.hasVerticalScroller = true
-        scrollView.autohidesScrollers = true
-        scrollView.drawsBackground = false
+        scrollView.autohidesScrollers = true // ✅ Richtig (Plural)        scrollView.drawsBackground = false
 
         let documentContainer = FlippedDocumentContainerView()
         documentContainer.targetSize = contentSize
@@ -1031,6 +1046,7 @@ class CanvasInteractionOverlayView: NSView {
             let halfSize = badgeSize / 2.0
             let fontSize: CGFloat = 15 * scale
             let borderWidth: CGFloat = max(1.5, 1.5 * scale)
+            let cornerRadius: CGFloat = 3 * scale
             
             let font = NSFont.boldSystemFont(ofSize: fontSize)
             let textAttributes: [NSAttributedString.Key: Any] = [
@@ -1046,6 +1062,7 @@ class CanvasInteractionOverlayView: NSView {
                     width: badgeSize,
                     height: badgeSize
                 )
+                let path = CGPath(roundedRect: badgeRect, cornerWidth: cornerRadius, cornerHeight: cornerRadius, transform: nil)
                 
                 // Schatten
                 context.saveGState()
@@ -1055,15 +1072,17 @@ class CanvasInteractionOverlayView: NSView {
                     color: NSColor.black.withAlphaComponent(0.25).cgColor
                 )
                 
-                // Weißer Kasten (deckt Linienende ab)
+                // Weißer Kasten mit dezent gerundeten Ecken
                 context.setFillColor(NSColor.white.cgColor)
-                context.fill(badgeRect)
+                context.addPath(path)
+                context.fillPath()
                 context.restoreGState()
                 
                 // Schwarzer Rahmen
                 context.setStrokeColor(NSColor.black.cgColor)
                 context.setLineWidth(borderWidth)
-                context.stroke(badgeRect)
+                context.addPath(path)
+                context.strokePath()
                 
                 // Zentrierter Text
                 let str = NSString(string: item.label)
@@ -1260,16 +1279,19 @@ struct CalloutBadgeView: View {
         let size: CGFloat = 24 * scale
         let fontSize: CGFloat = 15 * scale
         let lineWidth: CGFloat = max(1.5, 1.5 * scale)
+        let cornerRadius: CGFloat = 3 * scale
         
         Text(label)
             .font(.system(size: fontSize, weight: .bold, design: .default))
             .foregroundColor(.black)
             .frame(width: size, height: size)
             .background(Color.white)
+            .cornerRadius(cornerRadius)
             .overlay(
-                Rectangle()
-                    .stroke(Color.black, lineWidth: lineWidth)
+                RoundedRectangle(cornerRadius: cornerRadius)
+                    .strokeBorder(Color.black, lineWidth: lineWidth)
             )
             .shadow(color: Color.black.opacity(0.25), radius: 2 * scale, x: 1 * scale, y: 1 * scale)
+            .fixedSize()
     }
 }
