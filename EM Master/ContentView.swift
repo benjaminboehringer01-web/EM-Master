@@ -76,7 +76,9 @@ enum AppMode {
 struct ContentView: View {
     @State private var image: NSImage? = nil
     @State private var callouts: [CalloutItem] = []
+    @State private var overviewText: String = "" // NEU: Optionale Karte "Was sieht man?"
     @FocusState private var focusedId: UUID?
+    @FocusState private var isOverviewFocused: Bool
     
     // Nativer Zoom State
     @State private var magnification: CGFloat = 1.0
@@ -360,10 +362,12 @@ struct ContentView: View {
     private func resetApp() {
         NSApp.keyWindow?.makeFirstResponder(nil)
         self.focusedId = nil
+        self.isOverviewFocused = false
         
         withAnimation(.easeInOut(duration: 0.2)) {
             self.image = nil
             self.callouts.removeAll()
+            self.overviewText = ""
             self.magnification = 1.0
             self.mode = .annotate
             self.cropRectNorm = CGRect(x: 0.1, y: 0.1, width: 0.8, height: 0.8)
@@ -453,6 +457,7 @@ struct ContentView: View {
         withAnimation(.easeInOut(duration: 0.2)) {
             self.image = img
             self.callouts.removeAll()
+            self.overviewText = ""
             self.mode = .annotate
             self.isCopiedFeedback = false
             self.triggerFitToScreen = true
@@ -464,8 +469,10 @@ struct ContentView: View {
     private func copyCombinedToClipboard() {
         NSApp.keyWindow?.makeFirstResponder(nil)
         self.focusedId = nil
+        self.isOverviewFocused = false
         
-        guard let currentImage = image, !callouts.isEmpty else { return }
+        let trimmedOverview = overviewText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let currentImage = image, (!callouts.isEmpty || !trimmedOverview.isEmpty) else { return }
         let scale = currentImage.size.calloutScale
         
         let renderView = ZStack {
@@ -515,7 +522,12 @@ struct ContentView: View {
         
         let base64Image = pngData.base64EncodedString()
         
-        let listItemsHtml = callouts.map { item in
+        // --- 1. HTML String Zusammenbau ---
+        var listItemsHtml = ""
+        if !trimmedOverview.isEmpty {
+            listItemsHtml += "<li><strong>Was sieht man?</strong> &rarr; \(trimmedOverview)</li>"
+        }
+        listItemsHtml += callouts.map { item in
             let text = item.text.trimmingCharacters(in: .whitespaces)
             return "<li><strong>\(item.label)</strong> &rarr; \(text)</li>"
         }.joined(separator: "")
@@ -527,11 +539,18 @@ struct ContentView: View {
         </ul>
         """
         
-        let plainText = callouts.map { item in
+        // --- 2. Plain Text Zusammenbau ---
+        var plainLines: [String] = []
+        if !trimmedOverview.isEmpty {
+            plainLines.append("• Was sieht man? → \(trimmedOverview)")
+        }
+        plainLines.append(contentsOf: callouts.map { item in
             let text = item.text.trimmingCharacters(in: .whitespaces)
             return text.isEmpty ? "• \(item.label) →" : "• \(item.label) → \(text)"
-        }.joined(separator: "\n")
+        })
+        let plainText = plainLines.joined(separator: "\n")
         
+        // --- 3. RTFD String Zusammenbau ---
         let attrString = NSMutableAttributedString()
         let attachment = NSTextAttachment()
         attachment.image = nsImage
@@ -539,6 +558,10 @@ struct ContentView: View {
         attrString.append(NSAttributedString(string: "\n\n"))
         
         let font = NSFont.systemFont(ofSize: 14)
+        if !trimmedOverview.isEmpty {
+            let line = "• Was sieht man? → \(trimmedOverview)\n"
+            attrString.append(NSAttributedString(string: line, attributes: [.font: font]))
+        }
         for item in callouts {
             let text = item.text.trimmingCharacters(in: .whitespaces)
             let line = text.isEmpty ? "• \(item.label) →\n" : "• \(item.label) → \(text)\n"
@@ -582,9 +605,10 @@ struct ContentView: View {
                 Text("Beschriftungen")
                     .font(.headline)
                 Spacer()
-                if !callouts.isEmpty {
+                if !callouts.isEmpty || !overviewText.isEmpty {
                     Button("Marker leeren", role: .destructive) {
                         self.callouts.removeAll()
+                        self.overviewText = ""
                     }
                     .buttonStyle(.plain)
                     .foregroundColor(.red)
@@ -594,56 +618,68 @@ struct ContentView: View {
             
             Divider()
             
-            if callouts.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("• **Klick:** Marker mit Zeigerlinie")
-                    Text("• **⌘ + Klick:** Direkter Kasten ohne Linie")
-                    Text("• **Drag & Drop:** Bild direkt reinziehen")
-                }
-                .font(.callout)
-                .foregroundColor(.secondary)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView {
-                    VStack(spacing: 10) {
-                        ForEach(callouts) { item in
-                            if let idx = callouts.firstIndex(where: { $0.id == item.id }) {
-                                HStack(spacing: 8) {
-                                    CalloutBadgeView(label: item.label, scale: 1.0)
-                                    
-                                    Image(systemName: "arrow.right")
-                                        .foregroundColor(.secondary)
-                                        .font(.caption)
-                                    
-                                    TextField("Back of card", text: Binding(
-                                        get: {
-                                            guard callouts.indices.contains(idx) else { return "" }
-                                            return callouts[idx].text
-                                        },
-                                        set: { newValue in
-                                            guard callouts.indices.contains(idx) else { return }
-                                            callouts[idx].text = newValue
-                                        }
-                                    ))
-                                    .textFieldStyle(.roundedBorder)
-                                    .focused($focusedId, equals: item.id)
-                                    
-                                    Button(action: { removeCallout(id: item.id) }) {
-                                        Image(systemName: "xmark.circle.fill")
-                                            .foregroundColor(.secondary)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    // NEU: Die permanente "Was sieht man?" Zeile ganz oben
+                    overviewCardRow
+                    
+                    if !callouts.isEmpty {
+                        Divider()
+                            .padding(.vertical, 2)
+                    }
+                    
+                    // Dynamische Liste der Marker (A, B, C...)
+                    ForEach(callouts) { item in
+                        if let idx = callouts.firstIndex(where: { $0.id == item.id }) {
+                            HStack(spacing: 8) {
+                                CalloutBadgeView(label: item.label, scale: 1.0)
+                                
+                                Image(systemName: "arrow.right")
+                                    .foregroundColor(.secondary)
+                                    .font(.caption)
+                                
+                                TextField("Back of card", text: Binding(
+                                    get: {
+                                        guard callouts.indices.contains(idx) else { return "" }
+                                        return callouts[idx].text
+                                    },
+                                    set: { newValue in
+                                        guard callouts.indices.contains(idx) else { return }
+                                        callouts[idx].text = newValue
                                     }
-                                    .buttonStyle(.plain)
+                                ))
+                                .textFieldStyle(.roundedBorder)
+                                .focused($focusedId, equals: item.id)
+                                
+                                Button(action: { removeCallout(id: item.id) }) {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .foregroundColor(.secondary)
                                 }
+                                .buttonStyle(.plain)
                             }
                         }
                     }
-                    .padding(.vertical, 4)
+                    
+                    // Hilfetext bei leeren Markern
+                    if callouts.isEmpty {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("• **Klick:** Marker mit Zeigerlinie")
+                            Text("• **⌘ + Klick:** Direkter Kasten ohne Linie")
+                            Text("• **Drag & Drop:** Bild direkt reinziehen")
+                        }
+                        .font(.callout)
+                        .foregroundColor(.secondary)
+                        .padding(.top, 12)
+                    }
                 }
+                .padding(.vertical, 4)
             }
             
             Spacer()
             
             // BUTTON-GRUPPE
+            let hasContentToCopy = !callouts.isEmpty || !overviewText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            
             VStack(spacing: 8) {
                 Button(action: copyCombinedToClipboard) {
                     HStack(spacing: 8) {
@@ -657,7 +693,7 @@ struct ContentView: View {
                 .controlSize(.large)
                 .buttonStyle(.borderedProminent)
                 .tint(isCopiedFeedback ? .green : .accentColor)
-                .disabled(image == nil || callouts.isEmpty)
+                .disabled(image == nil || !hasContentToCopy)
                 
                 Button(role: .destructive, action: resetApp) {
                     HStack(spacing: 6) {
@@ -669,12 +705,46 @@ struct ContentView: View {
                 }
                 .controlSize(.large)
                 .buttonStyle(.bordered)
-                .disabled(image == nil && callouts.isEmpty)
+                .disabled(image == nil && callouts.isEmpty && overviewText.isEmpty)
             }
         }
         .padding(14)
-        .frame(minWidth: 280, maxWidth: 360)
+        .frame(minWidth: 290, maxWidth: 380)
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+    
+    // MARK: - Zeile für "Was sieht man?"
+    private var overviewCardRow: some View {
+        HStack(spacing: 8) {
+            Text("Was sieht man?")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundColor(.black)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 4)
+                .background(Color.white)
+                .overlay(
+                    Rectangle()
+                        .stroke(Color.black, lineWidth: 1.5)
+                )
+                .shadow(color: Color.black.opacity(0.15), radius: 1, x: 1, y: 1)
+                .fixedSize()
+            
+            Image(systemName: "arrow.right")
+                .foregroundColor(.secondary)
+                .font(.caption)
+            
+            TextField("Back of card (optional)", text: $overviewText)
+                .textFieldStyle(.roundedBorder)
+                .focused($isOverviewFocused)
+            
+            if !overviewText.isEmpty {
+                Button(action: { overviewText = "" }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
     }
     
     private var emptyStateView: some View {
@@ -883,7 +953,7 @@ struct NativeZoomableScrollView<Content: View>: NSViewRepresentable {
     }
 }
 
-// MARK: - Native AppKit Interaktions- & Zeichen-Overlay (100% CoreGraphics, kein Clipping-Bug)
+// MARK: - Native AppKit Interaktions- & Zeichen-Overlay (CoreGraphics)
 class CanvasInteractionOverlayView: NSView {
     override var isFlipped: Bool { true }
 
@@ -985,7 +1055,7 @@ class CanvasInteractionOverlayView: NSView {
                     color: NSColor.black.withAlphaComponent(0.25).cgColor
                 )
                 
-                // Weißer Kasten (deckt Linienende sauber ab)
+                // Weißer Kasten (deckt Linienende ab)
                 context.setFillColor(NSColor.white.cgColor)
                 context.fill(badgeRect)
                 context.restoreGState()
